@@ -12,13 +12,15 @@ cron: 30 8 * * *
      自动补签（最近优先，每月 5 张 SVIP 无门槛卡+金币通道）/ 会员信息查询
 
 环境变量：
-  BAIDUWP_COOKIE  百度网盘 cookie，必填。
-                  只需 BDUSS=...; STOKEN=...（成长值/积分通道仅 BDUSS 可用，
+  BAIDUWP_COOKIE         百度网盘 cookie，必填（两种写法可混用）：
+                           ① 单变量多账号：值内用 & 或换行分隔
+                           ② 编号轮询：BAIDUWP_COOKIE、BAIDUWP_COOKIE_1、
+                              BAIDUWP_COOKIE_2、...（每个变量一个账号，
+                              编号连续，断号后连续 3 个缺失停止扫描）
+                  值只需 BDUSS=...; STOKEN=...（成长值/积分通道仅 BDUSS 可用，
                   任务中心与补签需要 STOKEN，建议两个都带上）。
-                  多账号用 & 或换行分隔。
 
-  获取方式：浏览器登录 pan.baidu.com -> F12 -> Application -> Cookies
-            -> 复制 BDUSS 和 STOKEN 两个值。
+  获取方式见仓库 Wiki「Cookie 获取教程」。
   STOKEN 失效特征：推送中出现"任务中心签到失败: STOKEN 已失效"，
             其余功能不受影响，届时重新取一次 cookie 更新环境变量即可。
 
@@ -284,28 +286,55 @@ class BaiduPan:
 
 
 def load_cookies() -> list:
-    """从环境变量 BAIDUWP_COOKIE 读取，支持 & 和换行分隔多账号。"""
-    raw = os.getenv("BAIDUWP_COOKIE", "").strip()
-    if not raw:
-        # 兼容 config.json（dailycheckin 格式）
-        for path in ("config.json", "/ql/scripts/config.json"):
-            if os.path.isfile(path):
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        datas = json.load(f)
-                    return [str(c.get("cookie") or "").strip()
-                            for c in datas.get("BAIDUWP", []) if c.get("cookie")]
-                except Exception:
-                    pass
-        return []
-    cookies = re.split(r"[&\n]+", raw)
-    return [c.strip() for c in cookies if c.strip()]
+    """轮询环境变量读取 cookie，支持两种写法（可混用，按顺序执行）：
+
+    1. 单变量多账号：BAIDUWP_COOKIE 内用 & 或换行分隔
+    2. 编号变量：BAIDUWP_COOKIE、BAIDUWP_COOKIE_1、BAIDUWP_COOKIE_2、...
+       （编号需连续，中间断号后连续 3 个缺失即停止扫描）
+    """
+    cookies: list = []
+
+    def _split(value: str) -> list:
+        return [c.strip() for c in re.split(r"[&\n]+", value) if c.strip()]
+
+    base = os.getenv("BAIDUWP_COOKIE", "").strip()
+    if base:
+        cookies.extend(_split(base))
+    misses = 0
+    for i in range(1, 100):
+        var = os.getenv(f"BAIDUWP_COOKIE_{i}", "").strip()
+        if var:
+            misses = 0
+            cookies.extend(_split(var))
+        else:
+            misses += 1
+            if misses >= 3:
+                break
+    # 去重（保持顺序），避免同一账号重复执行
+    seen, unique = set(), []
+    for c in cookies:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    if unique:
+        return unique
+    # 兼容 config.json（dailycheckin 格式）
+    for path in ("config.json", "/ql/scripts/config.json"):
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    datas = json.load(f)
+                return [str(c.get("cookie") or "").strip()
+                        for c in datas.get("BAIDUWP", []) if c.get("cookie")]
+            except Exception:
+                pass
+    return []
 
 
 def main():
     cookies = load_cookies()
     if not cookies:
-        print("未配置 BAIDUWP_COOKIE 环境变量（多账号用 & 或换行分隔）")
+        print("未配置 cookie 环境变量：BAIDUWP_COOKIE（或 BAIDUWP_COOKIE_1、_2 ...）")
         sys.exit(1)
     results = []
     for i, cookie in enumerate(cookies, 1):
@@ -315,6 +344,8 @@ def main():
         except Exception as e:  # noqa: BLE001
             msg = f"执行异常: {e.__class__.__name__}: {e}"
         print(msg, "\n")
+        if "HTTP 4" in msg or "已失效" in msg:
+            msg += "\n（提示：该账号 cookie 可能无效或已失效，请核对对应的环境变量）"
         results.append(f"账号{i}\n{msg}")
         if i < len(cookies):
             time.sleep(3)
