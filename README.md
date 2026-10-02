@@ -10,6 +10,7 @@
 |---|---|---|---|
 | [baidu_netdisk.py](baidu_netdisk.py) | 百度网盘多合一签到 | `30 8 * * *` | `BAIDUWP_COOKIE` |
 | [wzyd.py](wzyd.py) | 王者营地签到 | `40 8 * * *` | `WZYD_TOKEN`、`WZYD_BODY`、`WZYD_WXQ_BODY` |
+| [rainyun.py](rainyun.py) | 雨云积分签到 | `50 8 * * *` | `RAINYUN_COOKIE` |
 
 ### 百度网盘多合一签到
 
@@ -59,6 +60,20 @@
 ```
 
 **返回码**（实测）：`returnCode 0`=签到成功；`-105203`=今日已签到；`-105206`=操作频繁（脚本自动等 60s 重试一次）；提示登录失效时重新抓包更新环境变量即可（签到态跟随 App 会话，通常数周至数月一换）。
+
+### 雨云积分签到
+
+完成 [app.rainyun.com](https://app.rainyun.com/account/reward/earn)「积分中心 → 赚取积分 → 每日签到」，多账号。接口从雨云前端代码逆向确认（2026-10）：`POST api.v2.rainyun.com/user/reward/tasks`（`{"task_name":"每日签到"}`），签到结果以重查任务列表状态为准；CSRF 令牌与 `RYS` 防护头脚本自动处理，无需手动配置。
+
+**环境变量 `RAINYUN_COOKIE`**：`api.v2.rainyun.com` 的完整 Cookie。
+
+获取：浏览器登录 [app.rainyun.com](https://app.rainyun.com) → F12 → 网络(Network) → 随便点一个 `api.v2.rainyun.com` 请求 → 请求标头 → 复制整个 `Cookie` 的值整段粘贴（形如 `xxx=yyy; zzz=aaa`）。注意是 `api.v2.rainyun.com` 域下的请求，不是 `app.rainyun.com` 的 cookie。
+
+多账号：值内用 `&` 或换行分隔（cookie 内部用分号分隔，所以多账号分隔符不能用分号）；也支持编号轮询 `RAINYUN_COOKIE`、`RAINYUN_COOKIE_1`、`RAINYUN_COOKIE_2` ……
+
+可选环境变量 `RAINYUN_DELAY`：每日随机延迟上限（分钟），默认 10，`0` 关闭。多账号之间随机间隔 3~15 秒。
+
+**返回码**：`code 0`=成功；`10012`=CSRF 失效（脚本自动刷新令牌重试）；`10004`=触发滑块验证码（去网页手动签一次后恢复自动）；`30002/30038`=Cookie 失效（重新复制更新，会话一般月级有效）。推送中还会提示其他可领取的积分任务（如绑定邮箱等一次性任务）。
 
 ## 订阅拉库（自动创建定时任务）
 
