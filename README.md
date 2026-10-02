@@ -22,6 +22,8 @@
 - 单变量内分隔：`BAIDUWP_COOKIE` 的值里用 `&` 或换行分隔多份
 - 编号轮询：`BAIDUWP_COOKIE`、`BAIDUWP_COOKIE_1`、`BAIDUWP_COOKIE_2` …… 每个变量一个账号（编号连续即可，个别跳号也能识别；某个账号失效不影响其余账号）
 
+可选环境变量 `BAIDUWP_DELAY`：每日随机延迟上限（分钟），默认 10——脚本启动后随机等待 0~10 分钟再执行，让每天实际签到时间不同（今天 8:31、明天 8:36 这样）；设为 `0` 关闭（手动调试用）。多账号之间也会随机间隔 3~15 秒。
+
 获取：浏览器登录 [pan.baidu.com](https://pan.baidu.com) → F12 → Application → Cookies → 复制 `BDUSS` 和 `STOKEN`。
 
 > STOKEN 说明：成长值/答题/PC 积分三个通道仅凭 BDUSS 即可运行；任务中心签到与补签需要 STOKEN。STOKEN 失效时推送会提示"任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"，其余功能不受影响，重新取一次 cookie 更新环境变量即可（频率约为月级）。

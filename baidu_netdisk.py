@@ -20,6 +20,10 @@ cron: 30 8 * * *
                   值只需 BDUSS=...; STOKEN=...（成长值/积分通道仅 BDUSS 可用，
                   任务中心与补签需要 STOKEN，建议两个都带上）。
 
+  BAIDUWP_DELAY    每日随机延迟上限（分钟），默认 10：脚本启动后随机等待
+                   0~10 分钟再执行，使每天实际签到时间不同；设为 0 关闭。
+                   手动调试时可设 0 立即执行。
+
   获取方式见仓库 Wiki「Cookie 获取教程」。
   STOKEN 失效特征：推送中出现"任务中心签到失败: STOKEN 已失效"，
             其余功能不受影响，届时重新取一次 cookie 更新环境变量即可。
@@ -30,6 +34,7 @@ cron: 30 8 * * *
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -224,7 +229,7 @@ class BaiduPan:
                 if data.get("errno") == 0 or "dev repeat" not in last_error:
                     break
                 wait = 15 * (attempt + 1)
-                print(f"  [{stage}] 设备换号风控(dev repeat)，{wait}s 后重试({attempt + 1}/2)...", flush=True)
+                print(f"  [{stage}] 设备换号风控(dev repeat)，{wait}s 后重试({attempt + 1}/3)...", flush=True)
                 time.sleep(wait)
             if data.get("errno") == 0:
                 return f"任务中心签到完成，累计 {(data.get('data') or {}).get('signin_days')} 天"
@@ -390,7 +395,21 @@ def load_cookies() -> list:
     return []
 
 
+def random_delay():
+    """启动随机延迟（默认 0~10 分钟），让每天实际执行时间有差异。"""
+    max_minutes = 10
+    raw = os.getenv("BAIDUWP_DELAY", "").strip()
+    if raw.isdigit():
+        max_minutes = int(raw)
+    if max_minutes <= 0:
+        return
+    seconds = random.randint(0, max_minutes * 60)
+    print(f"随机延迟 {seconds // 60} 分 {seconds % 60} 秒后开始（BAIDUWP_DELAY={max_minutes} 分钟内随机）...", flush=True)
+    time.sleep(seconds)
+
+
 def main():
+    random_delay()
     cookies = load_cookies()
     if not cookies:
         print("未配置 cookie 环境变量：BAIDUWP_COOKIE（或 BAIDUWP_COOKIE_1、_2 ...）")
@@ -410,7 +429,9 @@ def main():
             msg += "\n（提示：该账号 cookie 可能无效或已失效，请核对对应的环境变量）"
         results.append(f"{header}\n{msg}")
         if i < len(cookies):
-            time.sleep(3)
+            gap = random.randint(3, 15)
+            print(f"等待 {gap}s 后处理下一个账号...", flush=True)
+            time.sleep(gap)
     # 青龙通知（存在 notify.py 则推送）
     try:
         from notify import send  # type: ignore
