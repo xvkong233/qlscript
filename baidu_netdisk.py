@@ -212,7 +212,7 @@ class BaiduPan:
         # 服务端偶发对新设备收紧(param error)时，回退到共享已注册设备保签到成功。
         # dev repeat 为设备换号临时风控，等待后重试。
         data, last_error = {}, ""
-        for device in (self.task_base["cuid"], REGISTERED_DEVICE):
+        for stage, device in enumerate(("本账号固定设备", "共享注册设备")):
             for attempt in range(3):
                 try:
                     data = self._taskcenter_signin_once(device)
@@ -223,13 +223,18 @@ class BaiduPan:
                 last_error = data.get("error") or ""
                 if data.get("errno") == 0 or "dev repeat" not in last_error:
                     break
-                time.sleep(30 * (attempt + 1))
+                wait = 15 * (attempt + 1)
+                print(f"  [{stage}] 设备换号风控(dev repeat)，{wait}s 后重试({attempt + 1}/2)...", flush=True)
+                time.sleep(wait)
             if data.get("errno") == 0:
                 return f"任务中心签到完成，累计 {(data.get('data') or {}).get('signin_days')} 天"
             if "bduss" in last_error.lower():
                 return "任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"
             if "dev repeat" in last_error:
+                print("  共享设备也在风控窗口中，放弃本次重试", flush=True)
                 return "任务中心签到: 设备校验中(dev repeat)，下次运行自动重试"
+            if stage == 0:
+                print("  固定设备暂未被服务端接受，回退共享注册设备", flush=True)
         if "param error" in last_error:
             return "任务中心签到失败: 设备未注册(param error)，下次运行自动重试"
         return f"任务中心签到失败: {last_error or '未知错误'}"
