@@ -33,37 +33,32 @@
 
 ### 王者营地签到（王者 + 万象棋双渠道）
 
-重放抓包参数完成营地「游戏签到」，支持**王者荣耀**和**王者万象棋**两个渠道，多账号。脚本不做任何加解密，抓到的参数原样填入即可；参数由 App 内签到页的请求产生，失效后重新抓一次更新环境变量。
+重放抓包参数完成营地「福利中心-每日签到」，支持**王者荣耀**（gameId 20001）和**王者万象棋**（gameId 30001）两个渠道，多账号。接口经真实抓包验证（2026-10，营地 App 10.114.0916）：`POST kohcamp.qq.com/operation/action/newsignin`，请求体由请求头里的 `gameId` / `campRoleId` 自动构造。
 
-**环境变量**（多账号用 `;` 或换行分隔，按顺序与账号一一配对；也支持编号轮询 `WZYD_TOKEN_1`、`WZYD_TOKEN_2` ……）：
+**环境变量**：
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `WZYD_TOKEN` | ✅ | 账号鉴权参数，两种格式自动识别（见下） |
-| `WZYD_BODY` | ✅ | 王者荣耀签到请求体（抓包原样 JSON，含 `roleId`） |
-| `WZYD_WXQ_BODY` |  | 王者万象棋签到请求体（抓包原样 JSON）。万象棋角色与王者角色不同，需单独抓包；不配置则只签王者 |
-| `WZYD_WXQ_TOKEN` |  | 万象棋专用鉴权参数（默认复用对应账号的 `WZYD_TOKEN`） |
+| `WZYD_TOKEN` | ✅ | 王者频道鉴权：福利中心**任意一个** `kohcamp.qq.com` 请求的完整请求头，存成 JSON |
+| `WZYD_WXQ_TOKEN` |  | 万象棋频道鉴权：在「王者万象棋」页签的福利中心里抓一个 kohcamp 请求头。不配置则只签王者 |
+| `WZYD_BODY` / `WZYD_WXQ_BODY` |  | 可选，签到请求体原样 JSON（默认从请求头自动推导，一般不用配） |
 | `WZYD_DELAY` |  | 每日随机延迟上限（分钟），默认 10，`0` 关闭 |
 
-`WZYD_TOKEN` 两种格式（按内容自动识别）：
-- **MSDK 参数 JSON**（营地签到 H5 页抓包）：`{"appid":"…","openid":"…","msdkEncodeParam":"…","sig":"…","userId":"…","source":"…","encode":2,"timestamp":"…","algorithm":"v2","version":"3.1.96i"}` → 走 `/operation/action/signin`
-- **userid&token**（App 原生签到接口抓包）：`userid&token`（可带第三段 camproleid，忽略）→ 走 `/operation/action/newsignin`
+多账号：值内用 `;` 或换行分隔（JSON 值里带分号也没关系，脚本按花括号配对解析）；也支持编号轮询 `WZYD_TOKEN_1`、`WZYD_TOKEN_2` …… 两频道编号一一对应。
 
-注意分隔符：多账号只能用 `;` 或换行，**不要用 `&`**——`&` 在 userid&token 格式里是字段分隔符。
+**抓包方法**（抓包工具过滤 `kohcamp.qq.com`，如 Stream / Charles / Reqable / mitmproxy）：
 
-示例（两个账号，只签王者）：
+1. 王者营地 App → 底部「游戏」页签 → 点「王者荣耀」图标 → 「签到」进入福利中心
+2. 随便点开列表里任一 `kohcamp.qq.com` 请求，**复制全部请求头**，原样存成 JSON 填入 `WZYD_TOKEN`（请求头里已带 `gameId:20001` 和 `campRoleId`，脚本据此构造签到请求）
+3. 万象棋：回到「游戏」页签 → 点「王者万象棋」图标 → 「每日福利」进入其福利中心，同样抓一个 kohcamp 请求头填 `WZYD_WXQ_TOKEN`
 
-```text
-WZYD_TOKEN={"appid":"1001","openid":"AAA",...,"version":"3.1.96i"};{"appid":"1001","openid":"BBB",...,"version":"3.1.96i"}
-WZYD_BODY={"cSystem":"ios","h5Get":1,"roleId":"1685189495"}
-{"cSystem":"ios","h5Get":1,"roleId":"520128481"}
+示例（请求头长这样，字段较全，直接整体粘贴即可）：
+
+```json
+{"h5Get":"1","serverId":"1285","userId":"…","openid":"…","algorithm":"v2","msdkEncodeParam":"…","campRoleId":"…","sig":"…","encode":"2","roleId":"…","source":"smoba_zhushou","User-Agent":"Mozilla/5.0 …;GameHelper; …","noencrypt":"1","timestamp":"…","cClientVersionName":"10.114.0916","gameId":"20001","cSystem":"android","gameOpenid":"…","appid":"1105200115","token":"…","version":"3.1.96a"}
 ```
 
-**抓包方法**：抓包工具（Stream / Charles / Reqable 等）过滤 `kohcamp.qq.com` → 打开王者营地 App → 营地福利 → 游戏签到，分别在「王者荣耀」「王者万象棋」页签点一次签到：
-- 请求体 JSON → 填 `WZYD_BODY` / `WZYD_WXQ_BODY`
-- 鉴权：请求头里若是 `appid/openid/msdkEncodeParam/sig/…` 这组参数，照抓包原样组成 JSON 填 `WZYD_TOKEN`；若只有 `userid` 和 `token` 两个头，按 `userid&token` 填写
-
-失效特征：推送出现"登录态失效（鉴权参数已失效，请重新抓包更新环境变量）"，重新抓包更新即可（通常数周至数月一次，登录态跟着 App 会话走）。
+**返回码**（实测）：`returnCode 0`=签到成功；`-105203`=今日已签到；`-105206`=操作频繁（脚本自动等 60s 重试一次）；提示登录失效时重新抓包更新环境变量即可（签到态跟随 App 会话，通常数周至数月一换）。
 
 ## 订阅拉库（自动创建定时任务）
 
