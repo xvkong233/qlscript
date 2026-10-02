@@ -100,6 +100,19 @@ class BaiduPan:
         error_msg = str(data.get("error_msg") or data.get("show_msg") or "")
         return data.get("error_code") == -6 or "登录" in error_msg or "login" in error_msg.lower()
 
+    def get_username(self) -> str:
+        try:
+            resp = self.session.get(API_BASE + "/api/user/getinfo",
+                                    params={"need_selfinfo": "1"}, timeout=TIMEOUT)
+            records = (resp.json().get("records") or [])
+            if records:
+                info = records[0]
+                return (info.get("nick_name") or info.get("priority_name")
+                        or info.get("display_name") or "")
+        except Exception:
+            pass
+        return ""
+
     # ---------- 1. 成长值签到 ----------
     def get_sign_status(self):
         """返回 (today_signed, signed_cnt)；异常时 (None, None)，调用方降级为直接尝试签到。"""
@@ -338,15 +351,18 @@ def main():
         sys.exit(1)
     results = []
     for i, cookie in enumerate(cookies, 1):
-        print(f"===== 账号 {i} =====")
+        panel = BaiduPan(cookie)
+        username = panel.get_username()
+        header = f"===== 账号 {i} 【{username}】=====" if username else f"===== 账号 {i} ====="
+        print(header)
         try:
-            msg = BaiduPan(cookie).run()
+            msg = panel.run()
         except Exception as e:  # noqa: BLE001
             msg = f"执行异常: {e.__class__.__name__}: {e}"
         print(msg, "\n")
         if "HTTP 4" in msg or "已失效" in msg:
             msg += "\n（提示：该账号 cookie 可能无效或已失效，请核对对应的环境变量）"
-        results.append(f"账号{i}\n{msg}")
+        results.append(f"{header}\n{msg}")
         if i < len(cookies):
             time.sleep(3)
     # 青龙通知（存在 notify.py 则推送）
