@@ -11,6 +11,7 @@
 | [baidu_netdisk.py](baidu_netdisk.py) | 百度网盘多合一签到 | `30 8 * * *` | `BAIDUWP_COOKIE` |
 | [wzyd.py](wzyd.py) | 王者营地签到 | `40 8 * * *` | `WZYD_TOKEN`、`WZYD_BODY`、`WZYD_WXQ_BODY` |
 | [rainyun.py](rainyun.py) | 雨云积分签到 | `50 8 * * *` | `RAINYUN_COOKIE` |
+| [svyun.py](svyun.py) | 速维云签到 | `10 9 * * *` | `SVYUN_ACCOUNT` |
 
 ### 百度网盘多合一签到
 
@@ -75,6 +76,20 @@
 
 **返回码**：`code 0`=成功；`10012`=CSRF 失效（脚本自动刷新令牌重试）；`10004`=触发滑块验证码（去网页手动签一次后恢复自动）；`30002/30038`=Cookie 失效（重新复制更新，会话一般月级有效）。推送中还会提示其他可领取的积分任务（如绑定邮箱等一次性任务）。
 
+### 速维云签到
+
+完成 [速维云](https://www.svyun.com/plugin/86/index.htm)「每日签到 + 转盘抽奖」，多账号。速维云是基于魔方财务系统搭建的云服务器商家，脚本走其通用 console API（2026-10 线上验证）：账号密码自动登录（密码 AES-128-CBC 加密，魔方财务前端通用密钥，**无需抓包**），签到后自动把签到/连签奖励的抽奖次数全部用完并汇总奖品。
+
+**环境变量 `SVYUN_ACCOUNT`**：`用户名:密码`，用户名即注册/登录速维云用的邮箱或手机号，例如 `user@example.com:Pass1234`。分隔符也认全角冒号或 `----`；密码里含冒号没关系，按第一个冒号切分。
+
+多账号：值内用 `&` 或换行分隔；也支持编号轮询 `SVYUN_ACCOUNT`、`SVYUN_ACCOUNT_1`、`SVYUN_ACCOUNT_2` …… 注意：密码里含 `&` 时请改用换行或编号变量分隔账号。
+
+可选环境变量 `SVYUN_DELAY`：每日随机延迟上限（分钟），默认 10，`0` 关闭。多账号之间随机间隔 3~15 秒。
+
+**依赖**：`pycryptodome`（青龙 → 依赖管理 → Python3 → 创建依赖 → 填 `pycryptodome`）。
+
+**提示**：推送里展示连签/累计天数与抽奖奖品汇总；提示「验证码/安全验证」= 触发登录风控，先去浏览器登录一次再试；提示密码问题请核对 `用户名:密码` 格式。登录态（JWT）由脚本每次运行自动获取，无需手动维护 token。
+
 ## 订阅拉库（自动创建定时任务）
 
 青龙面板 → 订阅管理 → 创建订阅：
@@ -89,7 +104,7 @@
 
 每个脚本头部的 `new Env('任务名')` 和 `cron: ...` 注释会被青龙自动识别为任务名和定时规则，之后往本仓库新增脚本、订阅更新后会自动新建对应任务。
 
-**依赖安装**：青龙 → 依赖管理 → Python3 → 创建依赖 → 自动拆分填 `requests`。
+**依赖安装**：青龙 → 依赖管理 → Python3 → 创建依赖 → 自动拆分填 `requests`（速维云签到还需要 `pycryptodome`，一并添加即可）。
 
 ## 已知不可自动化的任务
 
@@ -98,5 +113,6 @@
 ## 致谢
 
 - [Sitoi/dailycheckin](https://github.com/Sitoi/dailycheckin)（MIT）：原始 baiduwp 模块与整体框架
+- [TomyJan/SvYunAutoSign](https://github.com/TomyJan/SvYunAutoSign)：速维云 console API 端点与登录密码加密参数参考
 - [whyour/qinglong](https://github.com/whyour/qinglong)：青龙面板
 
