@@ -27,6 +27,7 @@ cron: 30 8 * * *
 依赖：requests（青龙 依赖管理 -> Python3 -> 安装 requests）
 """
 
+import hashlib
 import json
 import os
 import re
@@ -50,9 +51,10 @@ PC_HEADERS = {
 TASK_BASE = {
     "clienttype": "1", "channel": "android_16_script_bd-netdisk_1027840c",
     "app": "android", "version": "13.34.3", "versioncode": "4228",
-    "cuid": "5ACF9C71D2E84B0FA6C8D2E91F3A7B55|dailycheckin",
-    "devuid": "5ACF9C71D2E84B0FA6C8D2E91F3A7B55|dailycheckin",
 }
+# 任务中心 signin 仅接受「已注册」设备（新设备报 param error，且注册需真实 App 流程），
+# 故签到共用这一个已注册设备；多账号先后签到时若触发 dev repeat（设备换号风控）会自动重试
+REGISTERED_DEVICE = "5ACF9C71D2E84B0FA6C8D2E91F3A7B55|dailycheckin"
 # 补签方式: 1=SVIP 无门槛卡(每月5张) 2=做任务 3=金币
 
 
@@ -61,6 +63,7 @@ class BaiduPan:
         cookie = cookie.strip()
         if "BDUSS=" not in cookie:
             cookie = f"BDUSS={cookie}"
+        self.cookie = cookie
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -72,6 +75,15 @@ class BaiduPan:
                 "Cookie": cookie,
             }
         )
+        # 任务中心把「设备+账号」按天绑定（共用设备会报 dev repeat），
+        # 因此从 cookie 派生每账号独立且稳定的设备标识（同一账号每天同一设备）
+        digest = hashlib.md5(cookie.encode("utf-8")).hexdigest().upper()
+        device = f"{digest}|{digest[:8]}"
+        self.task_base = {
+            **TASK_BASE,
+            "cuid": device,
+            "devuid": device,
+        }
 
     def _api_get(self, path: str, extra_params: dict, headers: dict = None) -> dict:
         params = dict(QUERY_PARAMS)
@@ -187,22 +199,44 @@ class BaiduPan:
         return f"积分签到成功，当前积分余额 {inner.get('points_balance')}"
 
     # ---------- 4. 任务中心签到 ----------
-    def taskcenter_signin(self) -> str:
-        params = dict(TASK_BASE)
+    def _taskcenter_signin_once(self, device: str) -> dict:
+        params = {"cuid": device, "devuid": device, **TASK_BASE}
         params.update({
             "task_id": "1666916321758720", "task_id_str": "1666916321758720",
             "task_from": "task_sys_daily", "is_growth": "1",
         })
-        data = self._pc_api("/coins/taskcenter/signin", params)
-        if data.get("errno") != 0:
-            if "bduss" in str(data.get("error", "")).lower():
+        return self._pc_api("/coins/taskcenter/signin", params)
+
+    def taskcenter_signin(self) -> str:
+        # 每账号固定设备（cookie 哈希派生，不随运行变化）优先；
+        # 服务端偶发对新设备收紧(param error)时，回退到共享已注册设备保签到成功。
+        # dev repeat 为设备换号临时风控，等待后重试。
+        data, last_error = {}, ""
+        for device in (self.task_base["cuid"], REGISTERED_DEVICE):
+            for attempt in range(3):
+                try:
+                    data = self._taskcenter_signin_once(device)
+                except RuntimeError as e:
+                    last_error = str(e)
+                    data = {"errno": -1, "error": last_error}
+                    break
+                last_error = data.get("error") or ""
+                if data.get("errno") == 0 or "dev repeat" not in last_error:
+                    break
+                time.sleep(30 * (attempt + 1))
+            if data.get("errno") == 0:
+                return f"任务中心签到完成，累计 {(data.get('data') or {}).get('signin_days')} 天"
+            if "bduss" in last_error.lower():
                 return "任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"
-            return f"任务中心签到失败: {data.get('error') or data.get('errno')}"
-        return f"任务中心签到完成，累计 {(data.get('data') or {}).get('signin_days')} 天"
+            if "dev repeat" in last_error:
+                return "任务中心签到: 设备校验中(dev repeat)，下次运行自动重试"
+        if "param error" in last_error:
+            return "任务中心签到失败: 设备未注册(param error)，下次运行自动重试"
+        return f"任务中心签到失败: {last_error or '未知错误'}"
 
     # ---------- 5. 自动补签 ----------
     def makeup_signin(self) -> str:
-        calendar = self._pc_api("/coins/taskcenter/signinlist", dict(TASK_BASE))
+        calendar = self._pc_api("/coins/taskcenter/signinlist", dict(self.task_base))
         if calendar.get("errno") != 0:
             return f"补签检查失败: {calendar.get('error') or calendar.get('errno')}"
         inner = calendar.get("data") or {}
@@ -225,7 +259,7 @@ class BaiduPan:
                 continue
             try:
                 pre = (self._pc_api("/coins/taskcenter/supptasklist",
-                                    {**TASK_BASE, "day": str(day)}).get("data")) or {}
+                                    {**self.task_base, "day": str(day)}).get("data")) or {}
             except RuntimeError:
                 skipped.append(f"day{day}(预检失败)")
                 continue
@@ -249,7 +283,7 @@ class BaiduPan:
                 continue
             try:
                 result = self._pc_api("/coins/taskcenter/suppsignin",
-                                      {**TASK_BASE, "day": str(day), "supp_type": str(supp_type)})
+                                      {**self.task_base, "day": str(day), "supp_type": str(supp_type)})
             except RuntimeError:
                 skipped.append(f"day{day}(请求失败)")
                 continue
@@ -304,10 +338,17 @@ def load_cookies() -> list:
     1. 单变量多账号：BAIDUWP_COOKIE 内用 & 或换行分隔
     2. 编号变量：BAIDUWP_COOKIE、BAIDUWP_COOKIE_1、BAIDUWP_COOKIE_2、...
        （编号需连续，中间断号后连续 3 个缺失即停止扫描）
+
+    兼容直接粘贴浏览器完整 cookie 串（串内 & 字符不会导致误切分：
+    含 BDUSS= 的值按 BDUSS= 边界切分账号）。
     """
     cookies: list = []
 
     def _split(value: str) -> list:
+        if "BDUSS=" in value:
+            # 按 BDUSS= 边界切分：完整 cookie 串里的 & 等字符不影响
+            parts = [p.lstrip("; ").strip() for p in re.split(r"(?=BDUSS=)", value)]
+            return [p for p in parts if p.startswith("BDUSS=") and len(p) > 20]
         return [c.strip() for c in re.split(r"[&\n]+", value) if c.strip()]
 
     base = os.getenv("BAIDUWP_COOKIE", "").strip()
