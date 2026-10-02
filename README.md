@@ -1,45 +1,47 @@
-# 百度网盘多合一每日签到（青龙面板版）
+# qlscript — 青龙面板脚本集
 
-基于 [Sitoi/dailycheckin](https://github.com/Sitoi/dailycheckin) 的 baiduwp 模块重写并增强，全部接口经真实抓包验证（2026-10）。原模块使用正则解析、无状态预检、失败时会泄露 cookie，本版全部修复并新增三个通道。
+多个青龙面板脚本的汇集仓库，**支持订阅自动创建定时任务**。
 
-## 功能
+## 脚本清单
 
-| 功能 | 接口通道 | 说明 |
-|---|---|---|
-| 会员成长值签到 | `membership/level` (H5) | 先查状态再签到，幂等 |
-| 每日答题 | `membergrowv2` | 题目接口直接下发答案，自动作答 |
-| PC 客户端积分签到 | `coins/pc/signin` | 每日 +5~8 积分，仅 BDUSS 即可 |
-| 任务中心签到 | `coins/taskcenter/signin` | 新版 App 通道，需 BDUSS+STOKEN |
-| **自动补签** | `supptasklist` / `suppsignin` | 漏签按**最近优先**自动补：每月 5 张 SVIP 无门槛卡优先，金币足够自动补，做任务类跳过并提示 |
-| 会员信息查询 | `membership/user` | 等级 + 成长值 |
+| 脚本 | 任务名 | 默认定时 | 环境变量 |
+|---|---|---|---|
+| [baidu_netdisk.py](baidu_netdisk.py) | 百度网盘多合一签到 | `30 8 * * *` | `BAIDUWP_COOKIE` |
 
-多账号：cookie 用 `&` 或换行分隔，逐账号执行。
+### 百度网盘多合一签到
 
-## 环境变量
+基于 [Sitoi/dailycheckin](https://github.com/Sitoi/dailycheckin) 的 baiduwp 模块重写并增强，全部接口经真实抓包验证（2026-10）。
 
-| 变量 | 必填 | 说明 |
-|---|---|---|
-| `BAIDUWP_COOKIE` | ✅ | `BDUSS=xxx; STOKEN=xxx`，多账号用 `&` 或换行分隔 |
+功能：**成长值签到 + 每日答题 + PC 客户端积分签到 + 任务中心签到 + 自动补签**（漏签最近优先：每月 5 张 SVIP 无门槛卡优先，金币足够自动补，做任务类跳过并提示）+ 会员信息查询。多账号支持（cookie 用 `&` 或换行分隔）。
 
-**获取 cookie**：浏览器登录 [pan.baidu.com](https://pan.baidu.com) → F12 → Application → Cookies → 复制 `BDUSS` 和 `STOKEN`。
+**环境变量 `BAIDUWP_COOKIE`**：`BDUSS=xxx; STOKEN=xxx`
+
+获取：浏览器登录 [pan.baidu.com](https://pan.baidu.com) → F12 → Application → Cookies → 复制 `BDUSS` 和 `STOKEN`。
 
 > STOKEN 说明：成长值/答题/PC 积分三个通道仅凭 BDUSS 即可运行；任务中心签到与补签需要 STOKEN。STOKEN 失效时推送会提示"任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"，其余功能不受影响，重新取一次 cookie 更新环境变量即可（频率约为月级）。
 
-## 青龙部署
+## 订阅拉库（自动创建定时任务）
 
-```
-拉库: 本仓库
-定时: 30 8 * * *
-命令: python3 baidu_netdisk.py
-依赖: requests
-```
+青龙面板 → 订阅管理 → 创建订阅：
 
-通知自动对接青龙自带 `notify.py`（存在即推送，缺省只打印日志）。
+| 字段 | 填写 |
+|---|---|
+| 类型 | GitHub 仓库 |
+| 链接 | `https://github.com/xvkong233/qlscript.git` |
+| 分支 | `main` |
+| 定时规则 | `0 * * * *`（更新订阅的频率，与脚本任务定时无关） |
+| 自动创建任务 | 开启 |
+
+每个脚本头部的 `new Env('任务名')` 和 `cron: ...` 注释会被青龙自动识别为任务名和定时规则，之后往本仓库新增脚本、订阅更新后会自动新建对应任务。
+
+**依赖安装**：青龙 → 依赖管理 → Python3 → 创建依赖 → 自动拆分填 `requests`。
 
 ## 已知不可自动化的任务
 
-任务中心的"观看广告视频"（依赖穿山甲广告 SDK 服务端验证回调）和第三方 App 推广任务（依赖对应 App 真实启动回传）**无法协议化**，已实测：该 App 原生层有证书锁定，无法通过中间人观察或伪造完成上报。这部分收益（约 200 积分/天）需要真实设备行为。
+百度网盘任务中心的"观看广告视频"（依赖穿山甲广告 SDK 服务端验证回调）和第三方 App 推广任务（依赖对应 App 真实启动回传）**无法协议化**，已实测：该 App 原生层有证书锁定，无法通过中间人观察或伪造完成上报。这部分收益（约 200 积分/天）需要真实设备行为。
 
 ## 致谢
 
 - [Sitoi/dailycheckin](https://github.com/Sitoi/dailycheckin)（MIT）：原始 baiduwp 模块与整体框架
+- [whyour/qinglong](https://github.com/whyour/qinglong)：青龙面板
+
