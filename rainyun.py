@@ -26,7 +26,7 @@ cron: 50 8 * * *
   RAINYUN_DELAY    每日随机延迟上限（分钟），默认 10：脚本启动后随机等待 0~10 分钟再执行，
                    使每天实际签到时间不同；设为 0 关闭（手动调试用）。账号间随机间隔 3~15 秒。
 
-返回码（前端错误码表）：code 0=成功；10012=CSRF 失效（脚本自动刷新令牌重试）；
+返回码（前端错误码表）：code 200=成功（HTTP 风格，实测 2026-10）；10012=CSRF 失效（脚本自动刷新令牌重试）；
      10004=触发滑块验证码（脚本无法过验证，请去网页手动签一次再恢复自动）；
      30002/30038=登录失效（重新复制 Cookie 更新环境变量，会话一般月级有效）。
      签到结果以重查任务列表 Status=2 为准，不依赖返回包语义。
@@ -100,6 +100,11 @@ class Account:
         return (data.get("code") or 0) if isinstance(data, dict) else 0
 
     @staticmethod
+    def _ok(data) -> bool:
+        """雨云成功包络 code=200（HTTP 风格，实测 2026-10）；兼容 0。"""
+        return Account._code(data) in (0, 200, 201, 204)
+
+    @staticmethod
     def _msg(data) -> str:
         return str(data.get("message") or "") if isinstance(data, dict) else ""
 
@@ -131,7 +136,7 @@ class Account:
             return err
         if self._login_expired(data):
             return "Cookie 已失效（需要登录）"
-        if self._code(data) != 0:
+        if not self._ok(data):
             return self._msg(data) or f"code {self._code(data)}"
         user = self._payload(data) or {}
         self.name = str(user.get("Name") or "")[:32]
@@ -151,7 +156,7 @@ class Account:
             return None, err
         if self._login_expired(data):
             return None, "Cookie 已失效（需要登录）"
-        if self._code(data) != 0:
+        if not self._ok(data):
             return None, self._msg(data) or f"code {self._code(data)}"
         tasks = self._payload(data)
         if not isinstance(tasks, list):
