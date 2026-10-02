@@ -2,7 +2,7 @@
 
 多个青龙面板脚本的汇集仓库，**支持订阅自动创建定时任务**。
 
-> 📖 **[Cookie 获取详细教程（点此查看）](docs/Cookie获取教程.md)** —— BDUSS/STOKEN 的获取、多账号、失效处理
+> 📖 **[Cookie 获取详细教程（Wiki）](https://github.com/xvkong233/qlscript/wiki/Cookie%E8%8E%B7%E5%8F%96%E6%95%99%E7%A8%8B)** —— BDUSS/STOKEN 的获取、多账号、失效处理
 
 ## 脚本清单
 
