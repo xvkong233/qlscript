@@ -203,6 +203,14 @@ DEVICE_STATE_TTL = 180 * 86400
 # 官方客户端用它做设备-账号绑定签名: rchannel = MD5(AK + uid + time + channel)
 APP_CLIENT_AK = "1e34f40405355a992583c9d7b166cd39"
 
+# /coins/taskcenter/* 的实测错误码（只记录已实测到的语义，未验证的不臆测）。
+TASKCENTER_ERRNO = {
+    2: "服务端不认可该设备/参数（实测：该设备在本账号下无登记记录）",
+    9230: "实测发生当日签到日历为「未签」，故不属于「今日已签」；且表现与"
+          "账号1/2 的 param error 不同，提示该设备已通过登记校验，卡点在签到本身",
+    9312: "该设备正在被其它账号使用或处于风控窗口",
+}
+
 # 等级预估：优先手工指定，其次向服务端要「等级↔成长值」档位表
 LEVEL_TABLE_ENV = os.getenv("BAIDUWP_LEVEL_TABLE", "").strip()
 DAILY_GROWTH_ENV = os.getenv("BAIDUWP_DAILY_GROWTH", "").strip()
@@ -913,6 +921,43 @@ class BaiduPan:
         return self._pc_api("/coins/taskcenter/checkdevmp",
                             {"cuid": device, "devuid": device, **TASK_BASE})
 
+    def _probe_device_register(self, label: str, device: str):
+        """问服务端：这台设备在本账号下是不是「新设备」（无登记记录）。
+
+        对应 App 的 PointCenterApi.checkDeviceUnique() -> GET /coins/taskcenter/checkdevmp，
+        errno == 0 表示「新设备」。返回 True / False / None(取不到结论)。
+        """
+        try:
+            check = self._taskcenter_checkdev(device)
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"  checkdevmp({label}) 请求失败: {e}", "WARN", self.log_tag)
+            return None
+        check_err = str(check.get("error") or "")
+        if check.get("errno") == 0:
+            is_new = True
+        elif "bduss" in check_err.lower() or "login" in check_err.lower():
+            is_new = None          # cookie 失效 -> 这是「取不到结论」，不能当成已登记
+        else:
+            is_new = False
+        if is_new is not None:
+            self.registry.note_check(device, is_new)
+        log(f"  checkdevmp({label}) -> is_new_device={is_new}", "INFO", self.log_tag)
+        return is_new
+
+    def _dump_taskcenter_state(self, label: str):
+        """签到失败且设备已在册时，把任务中心首页状态打进日志，定位非登记类失败。"""
+        try:
+            home = self._pc_api("/coins/taskcenter/home", dict(self.task_base))
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"  任务中心首页读取失败: {e}", "WARN", self.log_tag)
+            return
+        if home.get("errno") != 0:
+            log(f"  任务中心首页 errno={home.get('errno')} "
+                f"error={home.get('error') or home.get('errmsg')}", "WARN", self.log_tag)
+            return
+        log(f"  任务中心首页({label}) data: {brief(home.get('data'), 320)}",
+            "INFO", self.log_tag)
+
     def _taskcenter_signin_device(self, device: str, tries: int = 3):
         """在指定设备上尝试签到；仅 dev repeat 做退避重试。返回 (data, error)。"""
         data, error = {}, ""
@@ -987,63 +1032,60 @@ class BaiduPan:
                 self.registry.release_shared(device)
                 continue
 
-            if "param error" in error:
-                # 该设备没有「账号↔设备」登记记录：先用 App 的 checkdevmp 复核上报，
-                # 再给它一次机会（部分账号在 checkdev 之后即可放行）。
-                is_new = None
-                try:
-                    check = self._taskcenter_checkdev(device)
-                    check_err = str(check.get("error") or "")
-                    if check.get("errno") == 0:
-                        is_new = True
-                    elif "bduss" in check_err.lower() or "login" in check_err.lower():
-                        return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
-                    else:
-                        is_new = False
-                except (RuntimeError, requests.RequestException):
-                    pass
-                if is_new is not None:
-                    self.registry.note_check(device, is_new)
-                log(f"  checkdevmp({label}) -> is_new_device={is_new}", "INFO", self.log_tag)
-                # 第一优先：按官方客户端流程补上设备绑定参数后再试一次。
-                # cuid/devuid 只是标识；App 的每个请求还会带 rchannel/rand/time，
-                # 其中 rchannel = MD5(AK + uid + time + channel) 才是把设备与账号
-                # 绑定的签名。缺它时服务端可能无从登记该设备 -> param error。
-                try:
-                    app_data = self._taskcenter_signin_once(
-                        device, self._app_client_params(device))
-                except (RuntimeError, requests.RequestException) as e:
-                    app_data = {"errno": -1, "error": str(e)}
-                app_err = str(app_data.get("error") or "")
-                log(f"  按客户端流程重试({label}) -> errno={app_data.get('errno')} "
-                    f"error={app_err or '无'}", "INFO", self.log_tag)
-                if app_data.get("errno") == 0:
-                    if device == self.device:
-                        self.registry.bind(self.account_key, device)
-                    days = (app_data.get("data") or {}).get("signin_days")
-                    return f"任务中心签到: 完成，累计 {days} 天"
-                if "bduss" in app_err.lower() or "login" in app_err.lower():
-                    return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
-                # 第二优先：不带附加参数再试一次（覆盖 checkdevmp 有登记副作用的假设）
-                retry_data, retry_error = self._taskcenter_signin_device(device, tries=1)
-                if retry_data.get("errno") == 0:
-                    if device == self.device:
-                        self.registry.bind(self.account_key, device)
-                    days = (retry_data.get("data") or {}).get("signin_days")
-                    return f"任务中心签到: 完成，累计 {days} 天"
-                error = retry_error or error
-                if "dev repeat" in error:
-                    self.registry.set_cooldown(device, DEV_REPEAT_COOLDOWN, self.account_key)
-                    notes.append(f"{label}(设备校验中 dev repeat)")
-                    continue
-                need_register = True
-                notes.append(f"{label}(未登记)")
+            # 任何「非 dev repeat」的失败都先无条件问一次服务端：这台设备在本账号下
+            # 是不是「新设备」（无登记记录）。
+            # 不只在 param error 分支里探，是因为实测账号 3 拿到的是 errno 9230 而非
+            # param error —— 若只在 param error 里探，就永远拿不到它的设备登记状态，
+            # 诊断信息是残缺的，也没法判断卡点到底在不在登记。
+            is_new = self._probe_device_register(label, device)
+            if is_new is False:
+                # 设备已在册 —— 卡点不是登记，再走登记流程毫无意义，
+                # 直接把真实错误码、解读和任务中心首页状态打出来。
+                hint = TASKCENTER_ERRNO.get(data.get("errno"), "")
+                log(f"  设备已在册但签到仍失败: errno={data.get('errno')} "
+                    f"error={error or '无'}" + (f"  —— {hint}" if hint else ""),
+                    "WARN", self.log_tag)
+                self._dump_taskcenter_state(label)
+                # 共享设备在本账号下失败时释放占用，让同轮其它账号还能试
+                if shared:
+                    self.registry.release_shared(device)
+                notes.append(f"{label}(已登记但服务端仍拒绝 errno={data.get('errno')})")
                 continue
+            # 设备未登记（或状态未知）：按官方客户端流程补上设备绑定参数再试。
+            # cuid/devuid 只是标识；App 的每个请求还会带 rchannel/rand/time，
+            # 其中 rchannel = MD5(AK + uid + time + channel) 才是把设备与账号
+            # 绑定的签名。缺它时服务端可能无从登记该设备 -> param error。
+            try:
+                app_data = self._taskcenter_signin_once(
+                    device, self._app_client_params(device))
+            except (RuntimeError, requests.RequestException) as e:
+                app_data = {"errno": -1, "error": str(e)}
+            app_err = str(app_data.get("error") or "")
+            log(f"  按客户端流程重试({label}) -> errno={app_data.get('errno')} "
+                f"error={app_err or '无'}", "INFO", self.log_tag)
+            if app_data.get("errno") == 0:
+                if device == self.device:
+                    self.registry.bind(self.account_key, device)
+                days = (app_data.get("data") or {}).get("signin_days")
+                return f"任务中心签到: 完成，累计 {days} 天"
+            if "bduss" in app_err.lower() or "login" in app_err.lower():
+                return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+            # 第二优先：不带附加参数再试一次（覆盖 checkdevmp 有登记副作用的假设）
+            retry_data, retry_error = self._taskcenter_signin_device(device, tries=1)
+            if retry_data.get("errno") == 0:
+                if device == self.device:
+                    self.registry.bind(self.account_key, device)
+                days = (retry_data.get("data") or {}).get("signin_days")
+                return f"任务中心签到: 完成，累计 {days} 天"
+            error = retry_error or error
+            if "dev repeat" in error:
+                self.registry.set_cooldown(device, DEV_REPEAT_COOLDOWN, self.account_key)
+                notes.append(f"{label}(设备校验中 dev repeat)")
+                continue
+            need_register = True
+            notes.append(f"{label}(未登记)")
+            continue
 
-            # 其它失败多为瞬时问题：释放共享占用，让同轮其它账号还能试这台设备
-            if shared:
-                self.registry.release_shared(device)
-            notes.append(f"{label}({error or data.get('errno')})")
 
         detail = "；".join(notes) if notes else "无可用设备"
         if need_register:
@@ -1052,8 +1094,8 @@ class BaiduPan:
                 "或用 BAIDUWP_DEVICE / BAIDUWP_DEVICE_POOL 填入已登记设备后重跑",
                 "ERR", self.log_tag)
             return "任务中心签到: 失败（设备未在服务端登记）"
-        log(f"任务中心签到未完成明细: {detail}", "WARN", self.log_tag)
-        return f"任务中心签到: 未完成（{detail}）"
+        log(f"任务中心签到失败明细: {detail}", "WARN", self.log_tag)
+        return f"任务中心签到: 失败（{detail}）"
 
     # ---------- 5. 自动补签 ----------
     def makeup_signin(self) -> str:
