@@ -856,6 +856,33 @@ class BaiduPan:
         return f"积分签到成功，当前积分余额 {inner.get('points_balance')}"
 
     # ---------- 4. 任务中心签到 ----------
+    def _web_cuid(self) -> str:
+        """从 cookie 里取网页端 CUID（MAWEBCUID=web_xxx）。
+
+        它由服务端下发给浏览器，属于服务端已知的设备标识；
+        与脚本派生并伪装的安卓设备不是一回事。取不到返回空串。
+        """
+        m = re.search(r"MAWEBCUID=([^;,\s]+)", self.cookie)
+        return m.group(1) if m else ""
+
+    def _taskcenter_signin_web(self) -> dict:
+        """走网页端通道签一次：clienttype=5(wap) + 网页 CUID，不带安卓伪装。
+
+        动机：脚本的会话本来就是网页端拿的（PANWEB=1 / BDCLND / MAWEBCUID），
+        而任务中心请求却一直用 clienttype=1&app=android&channel=android_* 伪装 App。
+        客户端类型与会话来源不一致，服务端有可能因此不认可那台伪造设备。
+        实测 clienttype=5/8/1 都能通过参数校验，所以这条通道本身是通的。
+        """
+        params = {
+            "task_id": "1666916321758720", "task_id_str": "1666916321758720",
+            "task_from": "task_sys_daily", "is_growth": "1",
+        }
+        web_cuid = self._web_cuid()
+        if web_cuid:
+            params["cuid"] = web_cuid
+            params["devuid"] = web_cuid
+        return self._api_get("/coins/taskcenter/signin", params)
+
     def _taskcenter_today_signed(self):
         """读任务中心签到日历，判断今天是否已签。返回 True/False/None(取不到)。
 
@@ -992,8 +1019,27 @@ class BaiduPan:
         log(f"任务中心签到日历: today_signed={signed}", "INFO", self.log_tag)
         if signed is True:
             return "任务中心签到: 今日已签到"
+
         notes = []
         need_register = False
+        # 网页端通道优先试一次：会话本来就是网页端的，用服务端下发的 MAWEBCUID
+        # 而不是脚本伪装的安卓设备，可能根本不触发设备登记校验。
+        if self._web_cuid():
+            try:
+                web_data = self._taskcenter_signin_web()
+            except (RuntimeError, requests.RequestException) as e:
+                web_data = {"errno": -1, "error": str(e)}
+            web_err = str(web_data.get("error") or web_data.get("show_msg") or "")
+            log(f"  网页端通道(clienttype=5 + MAWEBCUID) -> errno={web_data.get('errno')} "
+                f"error={web_err or '无'}", "INFO", self.log_tag)
+            if web_data.get("errno") == 0:
+                days = (web_data.get("data") or {}).get("signin_days")
+                return f"任务中心签到: 完成，累计 {days} 天"
+            if "bduss" in web_err.lower() or "login" in web_err.lower():
+                return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+            notes.append(f"网页端通道({web_err or web_data.get('errno')})")
+        else:
+            log("  cookie 里没有 MAWEBCUID，跳过网页端通道", "INFO", self.log_tag)
         for label, device in self._device_candidates():
             shared = device != self.device
             # 冷却优先判定：它才是更准确的原因（上一版会把「冷却中」误报成「被其它账号占用」）
