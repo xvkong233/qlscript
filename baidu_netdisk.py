@@ -753,10 +753,10 @@ class BaiduPan:
                 if is_new is not None:
                     self.registry.note_check(device, is_new)
                 log(f"  checkdevmp({label}) -> is_new_device={is_new}", "INFO", self.log_tag)
-                if is_new:
-                    need_register = True
-                    notes.append(f"{label}(未登记)")
-                    continue
+                # 不论 checkdevmp 判定「新设备」与否，都补一次重试：
+                # 该接口是否带「设备登记」副作用尚无定论（App 侧 PointCenterApi.
+                # checkDeviceUnique 看起来只是查询），多打一次请求的代价远小于
+                # 漏签一天；若它确实有登记副作用，这一步就是签成的关键。
                 retry_data, retry_error = self._taskcenter_signin_device(device, tries=1)
                 if retry_data.get("errno") == 0:
                     if device == self.device:
