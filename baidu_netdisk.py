@@ -955,6 +955,10 @@ class BaiduPan:
         try:
             self.emit(self.growth_signin())
             self.emit(self.answer_daily_question())
+            # 会员等级/升级预估不依赖积分与任务中心。放在它们之前计算，
+            # 这样即使任务中心进入分钟级退避重试（多台设备累计可达数分钟），
+            # 升级天数也一定能出现在推送里。
+            self.emit(self.membership_report())
             try:
                 self.emit(self.pc_signin())
                 self.emit(self.taskcenter_signin())
@@ -962,7 +966,6 @@ class BaiduPan:
             except (requests.RequestException, RuntimeError) as e:
                 log(f"积分/任务通道异常: {e.__class__.__name__}: {e}", "ERR", self.log_tag)
                 self.emit(f"积分/任务通道: 异常（{e.__class__.__name__}）")
-            self.emit(self.membership_report())
         except requests.RequestException as e:
             log(f"网络请求异常: {e.__class__.__name__}: {e}", "ERR", self.log_tag)
             self.push.append(f"执行失败: 网络异常 {e.__class__.__name__}")
