@@ -100,6 +100,49 @@ def brief(value, limit=200):
     return text if len(text) <= limit else f"{text[:limit]}…(len={len(text)})"
 
 
+def structure_map(node, limit=220, max_depth=4):
+    """把未知结构的 JSON 压成「路径 = 类型/样本」清单。
+
+    用途：接口契约未知时，把 30KB 的原始 JSON 压成可贴回、可人工核对的一小段，
+    而不是截断原始 JSON —— 截断恰好会把关键分支切掉（本轮就吃过这个亏）。
+    """
+    lines = []
+
+    def walk(node, path, depth):
+        if len(lines) >= limit:
+            return
+        pad = "  " * depth
+        if isinstance(node, dict):
+            lines.append(f"{pad}{path} = object({len(node)} keys)")
+            for key, val in list(node.items()):
+                walk(val, str(key), depth + 1)
+        elif isinstance(node, (list, tuple)):
+            lines.append(f"{pad}{path} = array({len(node)})")
+            for i, val in enumerate(list(node)[:2]):
+                walk(val, f"[{i}]", depth + 1)
+        else:
+            lines.append(f"{pad}{path} = {type(node).__name__} {str(node)[:48]}")
+
+    if max_depth > 0:
+        walk(node, "", 0)
+    truncated = len(lines) >= limit
+    body = chr(10).join(f"      {line}" for line in lines[:limit])
+    if truncated:
+        body += chr(10) + "      …(已截断，共 %d+ 行)" % len(lines)
+    return body
+
+
+def dump_json(payload, path_hint: str):
+    """把原始响应全文落盘，便于离线核对；返回文件路径（失败返回空串）。"""
+    try:
+        target = os.path.join(os.path.dirname(os.path.abspath(DEVICE_STATE_FILE)), path_hint)
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        return target
+    except Exception:                # noqa: BLE001 只读目录下静默跳过
+        return ""
+
+
 def _mask_credential(value, keep=6):
     """凭据一律脱敏：只留头部若干字符与长度。"""
     raw = str(value or "")
@@ -338,6 +381,10 @@ class DeviceRegistry:
 
     def daily_growth(self, account_key: str) -> int:
         return int((self.data["growth"].get(account_key) or {}).get("daily_growth") or 0)
+
+    def release_shared(self, device: str):
+        """释放本次运行对共享设备的占用（失败时调用，避免瞬时问题烧掉整池）。"""
+        self._run_shared_users.pop(device, None)
 
     def acquire_shared(self, device: str, account_key: str) -> bool:
         """备用设备池独占：本次运行内同一台共享设备只允许一个账号使用。"""
@@ -684,6 +731,9 @@ class BaiduPan:
             except (RuntimeError, requests.RequestException) as e:
                 return {"errno": -1, "error": str(e)}, str(e)
             error = str(data.get("error") or "")
+            if data.get("errno") not in (0, None) and "dev repeat" not in error:
+                # 未知服务端错误码（如 9230 signin error）只留 errno 无法定位，留全量响应
+                log(f"    signin 原始响应: {brief(data, 320)}", "WARN", self.log_tag)
             if data.get("errno") == 0 or "dev repeat" not in error:
                 return data, error
             wait = 15 * (attempt + 1)
@@ -704,16 +754,21 @@ class BaiduPan:
         notes = []
         need_register = False
         for label, device in self._device_candidates():
-            if device != self.device and not self.registry.acquire_shared(device, self.account_key):
-                notes.append(f"{label}(本次运行已被其它账号占用)")
-                continue
+            shared = device != self.device
+            # 冷却优先判定：它才是更准确的原因（上一版会把「冷却中」误报成「被其它账号占用」）
             if self.registry.in_cooldown(device):
                 left = self.registry.cooldown_left(device)
                 notes.append(f"{label}(风控冷却中，约{max(1, left // 3600)}h后解除)")
                 continue
+            if shared and not self.registry.acquire_shared(device, self.account_key):
+                notes.append(f"{label}(本次运行已被其它账号占用)")
+                continue
 
             log(f"  尝试{label}: {device}", "INFO", self.log_tag)
-            data, error = self._taskcenter_signin_device(device)
+            # 账号自有设备做退避重试（可能是瞬时风控）；备用池是公共热设备，
+            # 90 秒内不会恢复，重试只是白等，交给冷却时间戳判定即可。
+            data, error = self._taskcenter_signin_device(
+                device, tries=1 if shared else 3)
             log(f"  {label} -> errno={data.get('errno')} error={error or '无'}",
                 "INFO", self.log_tag)
             if data.get("errno") == 0:
@@ -733,6 +788,7 @@ class BaiduPan:
             if "dev repeat" in error:
                 self.registry.set_cooldown(device, DEV_REPEAT_COOLDOWN, self.account_key)
                 notes.append(f"{label}(设备校验中 dev repeat)")
+                self.registry.release_shared(device)
                 continue
 
             if "param error" in error:
@@ -772,6 +828,9 @@ class BaiduPan:
                 notes.append(f"{label}(未登记)")
                 continue
 
+            # 其它失败多为瞬时问题：释放共享占用，让同轮其它账号还能试这台设备
+            if shared:
+                self.registry.release_shared(device)
             notes.append(f"{label}({error or data.get('errno')})")
 
         detail = "；".join(notes) if notes else "无可用设备"
@@ -893,8 +952,12 @@ class BaiduPan:
             return []
         pairs = _parse_level_table(data.get("data"))
         if not pairs:
-            log(f"等级档位表解析失败，原始 data 供人工核对: {brief(data.get('data'), 400)}",
-                "WARN", self.log_tag)
+            log("等级档位表解析失败：该接口返回的是「成长值获取规则」(level_detail)，"
+                "未必含等级门槛表；下面给出结构清单供人工核对。", "WARN", self.log_tag)
+            log("【结构清单】" + structure_map(data.get("data")), "WARN", self.log_tag)
+            dumped = dump_json(data.get("data"), ".baidu_level_config_dump.json")
+            if dumped:
+                log(f"原始响应全文已落盘: {dumped}", "WARN", self.log_tag)
             return []
         log(f"等级档位表来源: 服务端 method=config -> {pairs}", "INFO", self.log_tag)
         return pairs
