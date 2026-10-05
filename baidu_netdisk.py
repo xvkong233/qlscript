@@ -38,8 +38,8 @@ cron: 30 8 * * *
   BAIDUWP_DEBUG           置 1 打开 DEBUG 级日志（打印每次 HTTP 请求/响应摘要）
   BAIDUWP_LEVEL_TABLE     手工指定「等级:成长值门槛」表，形如 1:0,2:1000,5:10000；
                           默认自动向服务端查询（/rest/2.0/membership/level?method=config）
-  BAIDUWP_DAILY_GROWTH    手工指定日成长速度，用于升级天数预估；
-                          默认优先用本次实际获得的成长值（签到+答题）
+  BAIDUWP_DAILY_GROWTH    手工指定「每日基础增量」（不含任务奖励），仅当日增速来源
+                          不可用时使用；SVIP 通常 30，普通会员 12。升级天数按「每日增量 + 当日任务奖励」计算
 
   日志与推送是分开的：stdout（青龙日志面板）打印全部过程细节，
   推送只发送每个账号的结果行。
@@ -252,6 +252,55 @@ def _parse_level_table(payload) -> list:
         if len(pairs) >= 3 and all(a <= b for a, b in zip(values, values[1:])):
             return pairs
     return []
+
+
+def _parse_daily_increase(payload) -> int:
+    """取「每日成长值增量」（level_detail.daily_increase），取不到返回 0。
+
+    实测响应里形如:  "daily_increase": {"svip": {"vip2": 30}, "vip": {...}}
+    与 "daily_decrease": 10（非会员每日扣减）成对出现。
+    形状尚未完全确认，因此：只在同名键下取值、优先 svip 档、取该子树最大数值，
+    并做 1..500 的合理性夹取；任何一步不满足就返回 0，交由调用方回退。
+    """
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if str(key).lower() == "daily_increase":
+                    found.append(val)
+                walk(val)
+        elif isinstance(node, (list, tuple)):
+            for val in node:
+                walk(val)
+
+    def numeric_leaves(node, bucket):
+        if isinstance(node, dict):
+            for val in node.values():
+                numeric_leaves(val, bucket)
+        elif isinstance(node, (list, tuple)):
+            for val in node:
+                numeric_leaves(val, bucket)
+        elif isinstance(node, bool):
+            return
+        elif isinstance(node, (int, float)):
+            bucket.append(int(node))
+
+    walk(payload)
+    for branch in found:
+        # 优先 svip 档（超级会员的每日增量最大，且脚本账号基本都是 SVIP）
+        target = branch
+        if isinstance(branch, dict):
+            for key, val in branch.items():
+                if str(key).lower() == "svip":
+                    target = val
+                    break
+        bucket = []
+        numeric_leaves(target, bucket)
+        bucket = [v for v in bucket if 1 <= v <= 500]
+        if bucket:
+            return max(bucket)
+    return 0
 
 
 def _parse_level_table_expr(text: str) -> list:
@@ -925,7 +974,9 @@ class BaiduPan:
 
     # ---------- 7. 等级与升级预估 ----------
     def fetch_level_table(self):
-        """取「等级 ↔ 成长值门槛」档位表。
+        """取「等级 ↔ 成长值门槛」档位表；返回 (pairs, 原始配置)。
+        原始配置会透传给日增速解析（level_detail.daily_increase），所以
+        即使档位表拿不到，每日增量仍可能拿到。
 
         数据源优先级：
           1) BAIDUWP_LEVEL_TABLE 手工指定（形如 1:0,2:1000,5:10000）
@@ -937,19 +988,19 @@ class BaiduPan:
             pairs = _parse_level_table_expr(LEVEL_TABLE_ENV)
             if pairs:
                 log(f"等级档位表来源: BAIDUWP_LEVEL_TABLE -> {pairs}", "INFO", self.log_tag)
-                return pairs
+                return pairs, None
             log("BAIDUWP_LEVEL_TABLE 无法解析（形如 1:0,2:1000,5:10000），已忽略",
                 "WARN", self.log_tag)
         try:
             data = self._api_get("/rest/2.0/membership/level", {"method": "config"})
         except (RuntimeError, requests.RequestException) as e:
             log(f"等级档位表获取失败: {e}", "WARN", self.log_tag)
-            return []
+            return [], None
         if data.get("error_code") not in (0, None):
             log(f"等级档位表接口返回 error_code={data.get('error_code')} "
                 f"error_msg={data.get('error_msg')}（该接口需要有效 cookie）",
                 "WARN", self.log_tag)
-            return []
+            return [], data.get("data")
         pairs = _parse_level_table(data.get("data"))
         if not pairs:
             log("等级档位表解析失败：该接口返回的是「成长值获取规则」(level_detail)，"
@@ -958,26 +1009,46 @@ class BaiduPan:
             dumped = dump_json(data.get("data"), ".baidu_level_config_dump.json")
             if dumped:
                 log(f"原始响应全文已落盘: {dumped}", "WARN", self.log_tag)
-            return []
+            return [], data.get("data")
         log(f"等级档位表来源: 服务端 method=config -> {pairs}", "INFO", self.log_tag)
-        return pairs
+        return pairs, data.get("data")
 
-    def _daily_growth_rate(self) -> int:
-        """日成长速度：本次实测 > BAIDUWP_DAILY_GROWTH > 历史记录。
+    def _daily_growth_rate(self, config=None) -> int:
+        """日成长速度 = **每日增量 + 当日任务奖励**。
 
-        今天已经签过的账号本次实测是 0，会自动回退到历史记录，不会误报成 0。
+        官方公式: 成长值 =(开通 + 续费 + 每日×持续天数 + 任务)-(过期 + 解约)，
+        所以「每日」与「任务」是两部分相加 —— 只拿本次签到/答题实测值当增速
+        会严重低估（SVIP 的每日增量本身就有 30，任务奖励通常只有 10 上下）。
+
+        每日增量来源优先级:
+          1) 服务端等级配置 level_detail.daily_increase（最权威，需有效 cookie）
+          2) BAIDUWP_DAILY_GROWTH 手工指定（语义为「每日基础增量」，不含任务奖励）
+          3) 历史记录里的每日增量
+        任务奖励 = 本次实测（签到 + 答题）。今天已签过则本次为 0，此时只算每日增量。
         """
-        if self.observed_growth > 0:
-            self.registry.set_daily_growth(self.account_key, self.observed_growth)
-            log(f"日成长速度: {self.observed_growth}/天（本次实测）", "INFO", self.log_tag)
-            return self.observed_growth
-        if DAILY_GROWTH_ENV.isdigit() and int(DAILY_GROWTH_ENV) > 0:
-            log(f"日成长速度: {DAILY_GROWTH_ENV}/天（BAIDUWP_DAILY_GROWTH）", "INFO", self.log_tag)
-            return int(DAILY_GROWTH_ENV)
-        stored = self.registry.daily_growth(self.account_key)
-        log(f"日成长速度: {stored or '未知'}/天（历史记录；本次未获得成长值）",
+        base, base_src = 0, "未知"
+        if config is not None:
+            base = _parse_daily_increase(config)
+            if base > 0:
+                base_src = "服务端 level_detail.daily_increase"
+        if base <= 0 and DAILY_GROWTH_ENV.isdigit() and int(DAILY_GROWTH_ENV) > 0:
+            base, base_src = int(DAILY_GROWTH_ENV), "BAIDUWP_DAILY_GROWTH"
+        if base <= 0:
+            stored = self.registry.daily_growth(self.account_key)
+            if stored > 0:
+                base, base_src = stored, "历史记录"
+        task = self.observed_growth
+        if base <= 0 and task <= 0:
+            log("日成长速度: 未知（服务端配置与本地记录都没拿到，且本次未获得成长值）",
+                "WARN", self.log_tag)
+            return 0
+        total = base + task
+        log(f"日成长速度: {total}/天 = 每日{base}({base_src}) + 任务{task}(本次实测)",
             "INFO", self.log_tag)
-        return stored
+        if base > 0:
+            # 只持久化「每日增量」部分：它是账号长期属性，不含每天波动的任务奖励
+            self.registry.set_daily_growth(self.account_key, base)
+        return total
 
     def membership_report(self) -> str:
         """结果行：会员等级 / 成长值 / 距下一等级的预估天数。细节走日志。"""
@@ -987,7 +1058,7 @@ class BaiduPan:
             return ""
         level, value = int(level), int(value or 0)
         head = f"会员等级 SVIP{level}，成长值 {value}"
-        pairs = self.fetch_level_table()
+        pairs, config = self.fetch_level_table()
         nxt = next(((lv, th) for lv, th in pairs if lv > level), None)
         if nxt is None:
             if not pairs:
@@ -998,7 +1069,7 @@ class BaiduPan:
             return head
         next_level, threshold = nxt
         need = max(0, threshold - value)
-        gain = self._daily_growth_rate()
+        gain = self._daily_growth_rate(config)
         log(f"升级预估: SVIP{level}/{value} -> SVIP{next_level} 门槛 {threshold}，"
             f"还差 {need}，日增速 {gain or '未知'}", "INFO", self.log_tag)
         if need <= 0:
