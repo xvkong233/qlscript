@@ -206,8 +206,9 @@ APP_CLIENT_AK = "1e34f40405355a992583c9d7b166cd39"
 # /coins/taskcenter/* 的实测错误码（只记录已实测到的语义，未验证的不臆测）。
 TASKCENTER_ERRNO = {
     2: "服务端不认可该设备/参数（实测：该设备在本账号下无登记记录）",
-    9230: "实测发生当日签到日历为「未签」，故不属于「今日已签」；且表现与"
-          "账号1/2 的 param error 不同，提示该设备已通过登记校验，卡点在签到本身",
+    9230: "实测当日签到日历为「未签」（不属于「今日已签」），且该设备状态同样是"
+          "「未登记」—— 与账号1/2 同为未登记设备却报不同错误，说明它与设备登记无关，"
+          "而是账号维度的差异（实测该账号已连续签到 5 天，多于账号1/2 的 4 天）",
     9312: "该设备正在被其它账号使用或处于风控窗口",
 }
 
@@ -1022,6 +1023,8 @@ class BaiduPan:
 
         notes = []
         need_register = False
+        dumped = False          # 任务中心首页诊断每账号最多取一次
+        last_errno = None       # 最后一次 signin 失败的服务端错误码
         # 网页端通道优先试一次：会话本来就是网页端的，用服务端下发的 MAWEBCUID
         # 而不是脚本伪装的安卓设备，可能根本不触发设备登记校验。
         if self._web_cuid():
@@ -1083,6 +1086,7 @@ class BaiduPan:
             # 不只在 param error 分支里探，是因为实测账号 3 拿到的是 errno 9230 而非
             # param error —— 若只在 param error 里探，就永远拿不到它的设备登记状态，
             # 诊断信息是残缺的，也没法判断卡点到底在不在登记。
+            last_errno = data.get("errno")
             is_new = self._probe_device_register(label, device)
             if is_new is False:
                 # 设备已在册 —— 卡点不是登记，再走登记流程毫无意义，
@@ -1091,7 +1095,9 @@ class BaiduPan:
                 log(f"  设备已在册但签到仍失败: errno={data.get('errno')} "
                     f"error={error or '无'}" + (f"  —— {hint}" if hint else ""),
                     "WARN", self.log_tag)
-                self._dump_taskcenter_state(label)
+                if not dumped:
+                    self._dump_taskcenter_state(label)
+                    dumped = True
                 # 共享设备在本账号下失败时释放占用，让同轮其它账号还能试
                 if shared:
                     self.registry.release_shared(device)
@@ -1129,13 +1135,24 @@ class BaiduPan:
                 notes.append(f"{label}(设备校验中 dev repeat)")
                 continue
             need_register = True
+            last_errno = data.get("errno")
             notes.append(f"{label}(未登记)")
+            # 未登记 ≠ 一定就是登记问题：账号3 的设备同样未登记却报 9230。
+            # 因此这里也要取一份任务中心首页，否则这类错误永远缺证据。
+            if not dumped:
+                self._dump_taskcenter_state(label)
+                dumped = True
             continue
 
 
+        if notes and not dumped:
+            self._dump_taskcenter_state("收尾诊断")
         detail = "；".join(notes) if notes else "无可用设备"
         if need_register:
-            log(f"任务中心签到失败（设备未登记）明细: {detail}", "ERR", self.log_tag)
+            log(f"任务中心签到失败明细: {detail}", "ERR", self.log_tag)
+            hint = TASKCENTER_ERRNO.get(last_errno, "")
+            if hint:
+                log(f"  服务端错误码解读(errno={last_errno}): {hint}", "ERR", self.log_tag)
             # 实测确认：App 登记的是「它自己的 devuid」，脚本派生的这台不会被登记；
             # 只做第 1 步没用，必须把 App 的 devuid 取出来给脚本用。
             log("处理办法（两步都要做，只做第 1 步没用）:", "ERR", self.log_tag)
@@ -1147,6 +1164,10 @@ class BaiduPan:
                 "devuid= 参数（cuid= 通常同值）", "ERR", self.log_tag)
             log("     备选：App 配置存于 MMKV 的 deviceId 键，但该文件 RC4 加密，"
                 "不推荐手抠", "ERR", self.log_tag)
+            if last_errno not in (2, None):
+                # 设备未登记但服务端给的是别的错误码（如 9230）：不能只报「未登记」
+                return (f"任务中心签到: 失败（设备未登记，服务端另返回 "
+                        f"errno={last_errno}）")
             return "任务中心签到: 失败（设备未在服务端登记）"
         log(f"任务中心签到失败明细: {detail}", "WARN", self.log_tag)
         return f"任务中心签到: 失败（{detail}）"
