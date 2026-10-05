@@ -1090,9 +1090,17 @@ class BaiduPan:
         detail = "；".join(notes) if notes else "无可用设备"
         if need_register:
             log(f"任务中心签到失败（设备未登记）明细: {detail}", "ERR", self.log_tag)
-            log("处理办法: 用官方 App 打开一次「任务中心/积分中心」完成该账号的设备登记，"
-                "或用 BAIDUWP_DEVICE / BAIDUWP_DEVICE_POOL 填入已登记设备后重跑",
-                "ERR", self.log_tag)
+            # 实测确认：App 登记的是「它自己的 devuid」，脚本派生的这台不会被登记；
+            # 只做第 1 步没用，必须把 App 的 devuid 取出来给脚本用。
+            log("处理办法（两步都要做，只做第 1 步没用）:", "ERR", self.log_tag)
+            log("  1) 用官方 App 登录该账号，打开一次「任务中心/积分中心」—— "
+                "这一步把 App 自己的 devuid 登记到服务端", "ERR", self.log_tag)
+            log("  2) 取出该 App 的 devuid，填进 BAIDUWP_DEVICE_n（n=账号序号）。"
+                "脚本派生的是另一台设备，App 不会替它登记", "ERR", self.log_tag)
+            log("     取 devuid 最省事：手机抓包看 App 打开任务中心时请求 URL 里的 "
+                "devuid= 参数（cuid= 通常同值）", "ERR", self.log_tag)
+            log("     备选：App 配置存于 MMKV 的 deviceId 键，但该文件 RC4 加密，"
+                "不推荐手抠", "ERR", self.log_tag)
             return "任务中心签到: 失败（设备未在服务端登记）"
         log(f"任务中心签到失败明细: {detail}", "WARN", self.log_tag)
         return f"任务中心签到: 失败（{detail}）"
