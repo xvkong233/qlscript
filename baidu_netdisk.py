@@ -496,6 +496,36 @@ class DeviceRegistry:
     def daily_growth(self, account_key: str) -> int:
         return int((self.data["growth"].get(account_key) or {}).get("daily_growth") or 0)
 
+    def set_growth_value(self, account_key: str, value: int):
+        """记录本次读到的成长值，作为下次推算实测日增量的基线。"""
+        item = self.data["growth"].setdefault(account_key, {})
+        item["last_value"] = int(value)
+        item["last_ts"] = time.time()
+        self.save()
+
+    def growth_delta_rate(self, account_key: str, value: int, min_hours: float = 12.0):
+        """用「上次成长值 -> 本次成长值」的实测差值推算该账号的日增量。
+
+        实测数据：同一时刻三账号的成长值增量分别为 +0 / +20 / +30，对应不同
+        产品档位（年费 30 / 季月 20）。档位表是全局的、列不出账号属于哪一档，
+        而差值是这个账号自己的真实值，所以优先用它。
+
+        要求间隔 >= min_hours：否则会把同一天内的任务奖励误当成年日增量。
+        返回 (rate, span_hours)；不可用返回 (0, span_hours)。
+        """
+        item = self.data["growth"].get(account_key) or {}
+        last_value, last_ts = item.get("last_value"), item.get("last_ts")
+        if not isinstance(last_value, int) or not last_ts:
+            return 0, 0.0
+        span = (time.time() - float(last_ts)) / 3600.0
+        if span < min_hours:
+            return 0, span
+        delta = int(value) - last_value
+        if delta <= 0:
+            return 0, span
+        rate = int(round(delta / (span / 24.0)))
+        return (rate, span) if 1 <= rate <= 500 else (0, span)
+
     def release_shared(self, device: str):
         """释放本次运行对共享设备的占用（失败时调用，避免瞬时问题烧掉整池）。"""
         self._run_shared_users.pop(device, None)
@@ -1146,28 +1176,38 @@ class BaiduPan:
         log(f"等级档位表来源: 服务端 method=config -> {pairs}", "INFO", self.log_tag)
         return pairs, data.get("data")
 
-    def _daily_growth_rate(self, config=None) -> int:
+    def _daily_growth_rate(self, config=None, value=None) -> int:
         """日成长速度 = **每日增量 + 当日任务奖励**。
 
         官方公式: 成长值 =(开通 + 续费 + 每日×持续天数 + 任务)-(过期 + 解约)，
         所以「每日」与「任务」是两部分相加 —— 只拿本次签到/答题实测值当增速
         会严重低估（SVIP 的每日增量本身就有 30，任务奖励通常只有 10 上下）。
 
-        每日增量来源优先级:
-          1) 服务端等级配置 level_detail.daily_increase（最权威，需有效 cookie）
-          2) BAIDUWP_DAILY_GROWTH 手工指定（语义为「每日基础增量」，不含任务奖励）
-          3) 历史记录里的每日增量
-        任务奖励 = 本次实测（签到 + 答题）。今天已签过则本次为 0，此时只算每日增量。
+        每日增量来源优先级（从高到低）:
+          1) BAIDUWP_DAILY_GROWTH —— 用户对该账号的精确指定
+          2) 实测差值 —— 上次运行到本次运行成长值实际涨了多少（间隔需 >= 12h）
+          3) 服务端 level_detail.daily_increase —— 全局档位表，取年费档
+          4) 历史记录
+        第 2 项之所以排在档位表之前：档位表是全局的，列不出「这个账号是哪一档」。
+        实测三账号同刻增量为 +0/+20/+30，正好对应不同档位 —— 差值才是该账号的真实值。
+        任务奖励 = 本次实测（签到 + 答题）；今天已签过则为 0，此时只算每日增量。
         """
         base, base_src = 0, "未知"
-        if config is not None:
+        if DAILY_GROWTH_ENV.isdigit() and int(DAILY_GROWTH_ENV) > 0:
+            base, base_src = int(DAILY_GROWTH_ENV), "BAIDUWP_DAILY_GROWTH"
+        if base <= 0 and value is not None:
+            rate, span = self.registry.growth_delta_rate(self.account_key, value)
+            if rate > 0:
+                base, base_src = rate, f"实测差值(距上次 {span:.1f}h)"
+            elif span > 0:
+                log(f"实测差值不可用: 距上次仅 {span:.1f}h（需 >= 12h 才能排除任务奖励）",
+                    "INFO", self.log_tag)
+        if base <= 0 and config is not None:
             base = _parse_daily_increase(config)
             if base > 0:
-                base_src = "服务端 level_detail.daily_increase"
+                base_src = "服务端档位表(年费档，可能与本账号档位不符)"
                 detail = describe_daily_increase(config)
                 log(f"每日增量分档: {detail} -> 取 {base}/天", "INFO", self.log_tag)
-        if base <= 0 and DAILY_GROWTH_ENV.isdigit() and int(DAILY_GROWTH_ENV) > 0:
-            base, base_src = int(DAILY_GROWTH_ENV), "BAIDUWP_DAILY_GROWTH"
         if base <= 0:
             stored = self.registry.daily_growth(self.account_key)
             if stored > 0:
@@ -1183,6 +1223,9 @@ class BaiduPan:
         if base > 0:
             # 只持久化「每日增量」部分：它是账号长期属性，不含每天波动的任务奖励
             self.registry.set_daily_growth(self.account_key, base)
+        if value is not None:
+            # 记下本次成长值，作为下次推算实测日增量的基线
+            self.registry.set_growth_value(self.account_key, value)
         return total
 
     def membership_report(self) -> str:
@@ -1204,7 +1247,7 @@ class BaiduPan:
             return head
         next_level, threshold = nxt
         need = max(0, threshold - value)
-        gain = self._daily_growth_rate(config)
+        gain = self._daily_growth_rate(config, value)
         log(f"升级预估: SVIP{level}/{value} -> SVIP{next_level} 门槛 {threshold}，"
             f"还差 {need}，日增速 {gain or '未知'}", "INFO", self.log_tag)
         if need <= 0:
