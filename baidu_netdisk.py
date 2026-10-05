@@ -34,6 +34,16 @@ cron: 30 8 * * *
   BAIDUWP_DEVICE_RESET    置 1 时清空登记的设备绑定（下次运行重新生成/指定）
   BAIDUWP_DEVICE_COOLDOWN 设备风控冷却秒数，默认 43200（12 小时）
 
+  --- 日志与等级预估 ---
+  BAIDUWP_DEBUG           置 1 打开 DEBUG 级日志（打印每次 HTTP 请求/响应摘要）
+  BAIDUWP_LEVEL_TABLE     手工指定「等级:成长值门槛」表，形如 1:0,2:1000,5:10000；
+                          默认自动向服务端查询（/rest/2.0/membership/level?method=config）
+  BAIDUWP_DAILY_GROWTH    手工指定日成长速度，用于升级天数预估；
+                          默认优先用本次实际获得的成长值（签到+答题）
+
+  日志与推送是分开的：stdout（青龙日志面板）打印全部过程细节，
+  推送只发送每个账号的结果行。
+
   获取方式见仓库 Wiki「Cookie 获取教程」。
   STOKEN 失效特征：推送中出现"任务中心签到失败: STOKEN 已失效"，
             其余功能不受影响，届时重新取一次 cookie 更新环境变量即可。
@@ -52,6 +62,51 @@ import time
 import zlib
 
 import requests
+
+# ---------------------------------------------------------------------------
+# 日志 / 推送分离
+#
+#   日志(log)  : 写 stdout，带时间戳、账号标签与级别，供青龙日志面板排障；
+#   推送(push) : 只放每个账号的结果行，一眼看完。
+# 所有过程性输出一律走 log()；进入推送的文本由 BaiduPan.emit() 登记。
+# ---------------------------------------------------------------------------
+DEBUG = os.getenv("BAIDUWP_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def log(msg="", level="INFO", tag=""):
+    """写详细日志到 stdout。绝不进推送；也绝不打印 cookie 内容。"""
+    prefix = f"[{time.strftime('%H:%M:%S')}]"
+    if tag:
+        prefix += f"[{tag}]"
+    if level and level != "INFO":
+        prefix += f"[{level}]"
+    for line in str(msg).splitlines() or [""]:
+        print(f"{prefix} {line}", flush=True)
+
+
+def log_debug(msg, tag=""):
+    """仅 BAIDUWP_DEBUG 打开时输出。"""
+    if DEBUG:
+        log(msg, "DEBUG", tag)
+
+
+def brief(value, limit=200):
+    """把响应压成一行摘要，避免日志被大 JSON 淹没。"""
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else f"{text[:limit]}…(len={len(text)})"
+
+
+def _mask_credential(value, keep=6):
+    """凭据一律脱敏：只留头部若干字符与长度。"""
+    raw = str(value or "")
+    if len(raw) <= keep:
+        return "*" * len(raw)
+    return f"{raw[:keep]}…(len={len(raw)})"
+
 
 API_BASE = "https://pan.baidu.com"
 QUERY_PARAMS = {"app_id": "250528", "web": "1", "clienttype": "5", "clientinfo": "wap"}
@@ -101,6 +156,77 @@ DEFAULT_DEVICE_POOL = ("5ACF9C71D2E84B0FA6C8D2E91F3A7B55|dailycheckin",)
 DEV_REPEAT_COOLDOWN = max(0, int(os.getenv("BAIDUWP_DEVICE_COOLDOWN", "43200") or 43200))
 DEVICE_STATE_TTL = 180 * 86400
 
+# 等级预估：优先手工指定，其次向服务端要「等级↔成长值」档位表
+LEVEL_TABLE_ENV = os.getenv("BAIDUWP_LEVEL_TABLE", "").strip()
+DAILY_GROWTH_ENV = os.getenv("BAIDUWP_DAILY_GROWTH", "").strip()
+# 服务端配置里可能出现的等级/成长值字段名（契约未固定，见 fetch_level_table 注释）
+_LEVEL_KEYS = ("level", "growth_level", "growthlevel", "grade", "lvl", "current_level")
+_VALUE_KEYS = ("value", "growth_value", "growthvalue", "min_value", "minvalue",
+               "need_value", "threshold", "upgrade_value", "score")
+
+
+def _parse_level_table(payload) -> list:
+    """从服务端配置里挖出 [(level, threshold)]，升序。挖不干净就返回 []。
+
+    契约未固定，这里只认两种形状：
+      A) 显式字段： {"level": 3, "value": 10000}  /  [3, 10000]
+      B) 键值映射： {"1": 0, "2": 1000, "3": 5000, ...}
+    结果还会做单调性与长度校验 —— 宁可返回空，也不给错数。
+    """
+    strict, loose = {}, {}
+
+    def add(bucket, level, value):
+        try:
+            lv, val = int(level), int(value)
+        except (TypeError, ValueError):
+            return
+        if 1 <= lv <= 20 and 0 <= val <= 10 ** 9:
+            bucket.setdefault(lv, val)
+
+    def walk(node):
+        if isinstance(node, dict):
+            low = {str(k).lower(): v for k, v in node.items()}
+            lv = next((low[k] for k in _LEVEL_KEYS if k in low), None)
+            val = next((low[k] for k in _VALUE_KEYS if k in low), None)
+            if lv is not None and val is not None and not isinstance(val, (dict, list)):
+                add(strict, lv, val)
+            for k, v in low.items():
+                if not isinstance(v, (dict, list)):
+                    add(loose, k, v)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, (list, tuple)):
+            if len(node) == 2 and not isinstance(node[0], (dict, list)):
+                add(strict, node[0], node[1])
+            for v in node:
+                walk(v)
+
+    walk(payload)
+    for bucket in (strict, loose):
+        pairs = sorted(bucket.items())
+        values = [v for _, v in pairs]
+        # 至少 3 档且门槛单调不减，才算像一张等级表
+        if len(pairs) >= 3 and all(a <= b for a, b in zip(values, values[1:])):
+            return pairs
+    return []
+
+
+def _parse_level_table_expr(text: str) -> list:
+    """解析 BAIDUWP_LEVEL_TABLE，形如 '1:0,2:1000,5:10000'。"""
+    pairs = {}
+    for chunk in re.split(r"[,;\s]+", text or ""):
+        if not chunk:
+            continue
+        parts = re.split(r"[:=]", chunk, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pairs[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    ordered = sorted(pairs.items())
+    return ordered if len(ordered) >= 2 else []
+
 _DEVICE_RE = re.compile(r"^[A-Za-z0-9_.\-]{6,128}(\|[A-Za-z0-9_.\-]{1,64})?$")
 
 
@@ -123,7 +249,7 @@ class DeviceRegistry:
 
     def __init__(self, path: str):
         self.path = path
-        self.data = {"version": 1, "accounts": {}, "devices": {}}
+        self.data = {"version": 1, "accounts": {}, "devices": {}, "growth": {}}
         self._run_shared_users = {}      # device -> account_key（仅本次进程运行期）
         try:
             with open(self.path, encoding="utf-8") as f:
@@ -131,6 +257,7 @@ class DeviceRegistry:
             if isinstance(raw, dict):
                 self.data["accounts"] = raw.get("accounts") or {}
                 self.data["devices"] = raw.get("devices") or {}
+                self.data["growth"] = raw.get("growth") or {}
                 self._gc()
         except FileNotFoundError:
             pass
@@ -202,6 +329,16 @@ class DeviceRegistry:
             item["last_account"] = account_key
         self.save()
 
+    def set_daily_growth(self, account_key: str, growth: int):
+        """记录本账号实测的日成长速度，供「今天已签到」的后续运行复用。"""
+        item = self.data["growth"].setdefault(account_key, {})
+        item["daily_growth"] = int(growth)
+        item["updated_at"] = time.time()
+        self.save()
+
+    def daily_growth(self, account_key: str) -> int:
+        return int((self.data["growth"].get(account_key) or {}).get("daily_growth") or 0)
+
     def acquire_shared(self, device: str, account_key: str) -> bool:
         """备用设备池独占：本次运行内同一台共享设备只允许一个账号使用。"""
         owner = self._run_shared_users.get(device)
@@ -214,7 +351,14 @@ class DeviceRegistry:
 
 
 class BaiduPan:
+    log_tag = ""          # 类级默认值，避免非常规构造路径取不到该属性
+
     def __init__(self, cookie: str, index: int = 1, registry: DeviceRegistry = None):
+        # 日志标签必须在最早设置：_resolve_device_identity 里就要用
+        self.log_tag = f"账号{index}"
+        self.index = index      # _resolve_device_identity 会读 BAIDUWP_DEVICE_{index}
+        self.push = []          # 只进推送的结果行
+        self.observed_growth = 0  # 本次实际获得的成长值（签到+答题）
         cookie = cookie.strip()
         if "BDUSS=" not in cookie:
             cookie = f"BDUSS={cookie}"
@@ -239,6 +383,18 @@ class BaiduPan:
         # 补签通道（signinlist/supptasklist/suppsignin）与签到通道共用同一台设备，
         # 保证服务端看到的「账号 ↔ 设备」绑定在所有任务中心接口上是一致的。
         self.task_base = {**TASK_BASE, "cuid": self.device, "devuid": self.device}
+        log(f"账号识别: uid={self.uid or '(未取到)'} account_key={self.account_key} "
+            f"cookie=[BDUSS/STOKEN 已隐藏]", "INFO", self.log_tag)
+        log(f"任务中心设备: {self.device}（来源: "
+            f"{'环境变量指定' if self.device != self._legacy_device(self.cookie) else '登记表/老算法'}）",
+            "INFO", self.log_tag)
+
+    def emit(self, line: str) -> str:
+        """登记一条「结果行」：进推送列表，同时在日志里留档。"""
+        if line:
+            self.push.append(line)
+            log(line, "RESULT", self.log_tag)
+        return line
 
     # ---------- 任务中心设备身份 ----------
     def get_uid(self) -> str:
@@ -361,23 +517,32 @@ class BaiduPan:
                 f"{path} 响应非 JSON（HTTP {resp.status_code}，"
                 f"body 前 80 字节: {raw[:80]!r}；cookie 可能已失效）")
 
+    def _http_get(self, path: str, params: dict, headers: dict) -> dict:
+        """统一出口：发请求 + 记录请求/响应摘要日志 + 统一错误。"""
+        started = time.time()
+        try:
+            resp = self.session.get(API_BASE + path, params=params,
+                                    headers=headers, timeout=TIMEOUT, stream=True)
+        except requests.RequestException as e:
+            log(f"HTTP {path} 连接失败: {e.__class__.__name__}: {e}", "ERR", self.log_tag)
+            raise
+        cost = time.time() - started
+        if resp.status_code != 200:
+            resp.close()
+            log(f"HTTP {path} -> {resp.status_code}（{cost:.2f}s）", "ERR", self.log_tag)
+            raise RuntimeError(f"{path} 请求失败 HTTP {resp.status_code}")
+        data = self._decode_json(resp, path)
+        log_debug(f"GET {path} params={brief(params)} -> {brief(data, 160)} "
+                  f"({cost:.2f}s)", self.log_tag)
+        return data
+
     def _api_get(self, path: str, extra_params: dict, headers: dict = None) -> dict:
         params = dict(QUERY_PARAMS)
         params.update(extra_params)
-        resp = self.session.get(API_BASE + path, params=params,
-                                headers=headers, timeout=TIMEOUT, stream=True)
-        if resp.status_code != 200:
-            resp.close()
-            raise RuntimeError(f"{path} 请求失败 HTTP {resp.status_code}")
-        return self._decode_json(resp, path)
+        return self._http_get(path, params, headers)
 
     def _pc_api(self, path: str, params: dict) -> dict:
-        resp = self.session.get(API_BASE + path, params=params,
-                                headers=PC_HEADERS, timeout=TIMEOUT, stream=True)
-        if resp.status_code != 200:
-            resp.close()
-            raise RuntimeError(f"{path} 请求失败 HTTP {resp.status_code}")
-        return self._decode_json(resp, path)
+        return self._http_get(path, params, PC_HEADERS)
 
     @staticmethod
     def _not_logged_in(data: dict) -> bool:
@@ -422,10 +587,18 @@ class BaiduPan:
 
     def growth_signin(self) -> str:
         today_signed, signed_cnt = self.get_sign_status()
+        log(f"成长值签到: signinlist -> today_signed={today_signed} "
+            f"signed_cnt={signed_cnt}", "INFO", self.log_tag)
         if today_signed:
             return f"今日已签到，已连续签到 {signed_cnt} 天" if signed_cnt else "今日已签到"
         points, error_msg = self.signin()
+        log(f"成长值签到: signin -> points={points} error={error_msg or '无'}",
+            "INFO", self.log_tag)
         if points is not None:
+            try:
+                self.observed_growth += int(points)
+            except (TypeError, ValueError):
+                pass
             msg = f"签到成功，获得 {points} 成长值"
             if signed_cnt is not None:
                 msg += f"，已连续签到 {signed_cnt + 1} 天"
@@ -436,9 +609,13 @@ class BaiduPan:
     def answer_daily_question(self) -> str:
         data = self._api_get("/act/v2/membergrowv2/getdailyquestion", {})
         if data.get("errno") not in (0, None):
+            log(f"每日答题: 取题接口 errno={data.get('errno')} "
+                f"show_msg={data.get('show_msg')}，跳过答题", "WARN", self.log_tag)
             return ""
         inner = data.get("data") or {}
         ask_id, answer, status = inner.get("ask_id"), inner.get("answer"), inner.get("answer_status")
+        log(f"每日答题: ask_id={ask_id} answer_status={status} "
+            f"answer={'-' if answer is None else answer}", "INFO", self.log_tag)
         if not ask_id:
             return ""
         if status == 1:
@@ -452,7 +629,13 @@ class BaiduPan:
         if result.get("errno") == 9502:
             return "今日已答题"
         score = (result.get("data") or {}).get("score")
+        log(f"每日答题: answerquestion -> errno={result.get('errno')} score={score}",
+            "INFO", self.log_tag)
         if score is not None:
+            try:
+                self.observed_growth += int(score)
+            except (TypeError, ValueError):
+                pass
             return f"答题成功，获得 {score} 成长值"
         show_msg = (result.get("data") or {}).get("show_msg") or result.get("show_msg") or "答题失败"
         return f"答题: {show_msg}"
@@ -460,6 +643,9 @@ class BaiduPan:
     # ---------- 3. PC 积分签到 ----------
     def pc_signin(self) -> str:
         status = self._pc_api("/coins/pc/signinlist", {"clienttype": "8", "win64": "1", "vip": "2"})
+        log(f"PC 积分: signinlist -> errno={status.get('errno')} "
+            f"signed_today={(status.get('data') or {}).get('signed_today')} "
+            f"balance={(status.get('data') or {}).get('points_balance')}", "INFO", self.log_tag)
         if status.get("errno") != 0:
             return f"积分签到状态查询失败: {status.get('error') or status.get('errno')}"
         inner = status.get("data") or {}
@@ -501,8 +687,8 @@ class BaiduPan:
             if data.get("errno") == 0 or "dev repeat" not in error:
                 return data, error
             wait = 15 * (attempt + 1)
-            print(f"    设备重复触发风控(dev repeat)，{wait}s 后重试({attempt + 1}/{tries})...",
-                  flush=True)
+            log(f"    设备重复触发风控(dev repeat)，{wait}s 后重试({attempt + 1}/{tries})...",
+                "WARN", self.log_tag)
             time.sleep(wait)
         return data, error
 
@@ -526,8 +712,10 @@ class BaiduPan:
                 notes.append(f"{label}(风控冷却中，约{max(1, left // 3600)}h后解除)")
                 continue
 
-            print(f"  使用{label}签到...", flush=True)
+            log(f"  尝试{label}: {device}", "INFO", self.log_tag)
             data, error = self._taskcenter_signin_device(device)
+            log(f"  {label} -> errno={data.get('errno')} error={error or '无'}",
+                "INFO", self.log_tag)
             if data.get("errno") == 0:
                 # 只有账号自有设备才回写绑定；备用池是公共兜底资源，
                 # 一旦永久绑定给某个账号，其它账号就再也用不上它了。
@@ -535,10 +723,12 @@ class BaiduPan:
                     self.registry.bind(self.account_key, device)
                 self.registry.set_cooldown(device, 0, self.account_key)
                 days = (data.get("data") or {}).get("signin_days")
-                return f"任务中心签到完成，累计 {days} 天"
+                return f"任务中心签到: 完成，累计 {days} 天"
 
             if "bduss" in error.lower() or "login" in error.lower():
-                return "任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"
+                log("任务中心签到失败: 服务端返回 bduss 错误，说明 cookie 缺少有效的 "
+                    "STOKEN（任务中心通道必须带 STOKEN）", "ERR", self.log_tag)
+                return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
 
             if "dev repeat" in error:
                 self.registry.set_cooldown(device, DEV_REPEAT_COOLDOWN, self.account_key)
@@ -555,13 +745,14 @@ class BaiduPan:
                     if check.get("errno") == 0:
                         is_new = True
                     elif "bduss" in check_err.lower() or "login" in check_err.lower():
-                        return "任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"
+                        return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
                     else:
                         is_new = False
                 except (RuntimeError, requests.RequestException):
                     pass
                 if is_new is not None:
                     self.registry.note_check(device, is_new)
+                log(f"  checkdevmp({label}) -> is_new_device={is_new}", "INFO", self.log_tag)
                 if is_new:
                     need_register = True
                     notes.append(f"{label}(未登记)")
@@ -571,7 +762,7 @@ class BaiduPan:
                     if device == self.device:
                         self.registry.bind(self.account_key, device)
                     days = (retry_data.get("data") or {}).get("signin_days")
-                    return f"任务中心签到完成，累计 {days} 天"
+                    return f"任务中心签到: 完成，累计 {days} 天"
                 error = retry_error or error
                 if "dev repeat" in error:
                     self.registry.set_cooldown(device, DEV_REPEAT_COOLDOWN, self.account_key)
@@ -585,10 +776,13 @@ class BaiduPan:
 
         detail = "；".join(notes) if notes else "无可用设备"
         if need_register:
-            return (f"任务中心签到失败: 设备尚未在服务端登记（{detail}）。"
-                    "请用官方 App 打开一次「任务中心/积分中心」完成该账号的设备登记，"
-                    "或用 BAIDUWP_DEVICE/BAIDUWP_DEVICE_POOL 填入已登记设备后重跑")
-        return f"任务中心签到未完成: {detail}"
+            log(f"任务中心签到失败（设备未登记）明细: {detail}", "ERR", self.log_tag)
+            log("处理办法: 用官方 App 打开一次「任务中心/积分中心」完成该账号的设备登记，"
+                "或用 BAIDUWP_DEVICE / BAIDUWP_DEVICE_POOL 填入已登记设备后重跑",
+                "ERR", self.log_tag)
+            return "任务中心签到: 失败（设备未在服务端登记）"
+        log(f"任务中心签到未完成明细: {detail}", "WARN", self.log_tag)
+        return f"任务中心签到: 未完成（{detail}）"
 
     # ---------- 5. 自动补签 ----------
     def makeup_signin(self) -> str:
@@ -620,6 +814,8 @@ class BaiduPan:
                 skipped.append(f"day{day}(预检失败)")
                 continue
             supp_type = pre.get("supp_type")
+            log(f"  补签 day{day}: supp_type={supp_type} "
+                f"coins_consumed={pre.get('coins_consumed')}", "INFO", self.log_tag)
             if supp_type == 1:
                 ok, note = True, "无门槛卡"
             elif supp_type == 3:
@@ -648,9 +844,13 @@ class BaiduPan:
             else:
                 skipped.append(f"day{day}({result.get('error') or result.get('errno')})")
 
-        msg = f"补签成功 {len(done)} 天" + (": " + "、".join(done) if done else "")
+        if done:
+            log(f"补签成功明细: {'、'.join(done)}", "INFO", self.log_tag)
         if skipped:
-            msg += f"；未处理 {len(skipped)} 天: " + "、".join(skipped)
+            log(f"补签跳过明细: {'、'.join(skipped)}", "INFO", self.log_tag)
+        msg = f"补签: 成功 {len(done)} 天"
+        if skipped:
+            msg += f"，跳过 {len(skipped)} 天"
         return msg
 
     # ---------- 6. 会员信息 ----------
@@ -664,28 +864,112 @@ class BaiduPan:
         level_info = data.get("level_info") or {}
         return level_info.get("current_level"), level_info.get("current_value")
 
-    # ---------- 主流程 ----------
-    def run(self) -> str:
-        msg = []
+    # ---------- 7. 等级与升级预估 ----------
+    def fetch_level_table(self):
+        """取「等级 ↔ 成长值门槛」档位表。
+
+        数据源优先级：
+          1) BAIDUWP_LEVEL_TABLE 手工指定（形如 1:0,2:1000,5:10000）
+          2) /rest/2.0/membership/level?method=config
+             —— 即 App/H5 的 getUpgradeLevelConfig（会员中心「成长值与等级关系表」）
+        两者都拿不到就返回 []，ETA 不显示；宁可不说，也不猜一个数出来。
+        """
+        if LEVEL_TABLE_ENV:
+            pairs = _parse_level_table_expr(LEVEL_TABLE_ENV)
+            if pairs:
+                log(f"等级档位表来源: BAIDUWP_LEVEL_TABLE -> {pairs}", "INFO", self.log_tag)
+                return pairs
+            log("BAIDUWP_LEVEL_TABLE 无法解析（形如 1:0,2:1000,5:10000），已忽略",
+                "WARN", self.log_tag)
         try:
-            msg.append(self.growth_signin())
-            answer = self.answer_daily_question()
-            if answer:
-                msg.append(answer)
+            data = self._api_get("/rest/2.0/membership/level", {"method": "config"})
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"等级档位表获取失败: {e}", "WARN", self.log_tag)
+            return []
+        if data.get("error_code") not in (0, None):
+            log(f"等级档位表接口返回 error_code={data.get('error_code')} "
+                f"error_msg={data.get('error_msg')}（该接口需要有效 cookie）",
+                "WARN", self.log_tag)
+            return []
+        pairs = _parse_level_table(data.get("data"))
+        if not pairs:
+            log(f"等级档位表解析失败，原始 data 供人工核对: {brief(data.get('data'), 400)}",
+                "WARN", self.log_tag)
+            return []
+        log(f"等级档位表来源: 服务端 method=config -> {pairs}", "INFO", self.log_tag)
+        return pairs
+
+    def _daily_growth_rate(self) -> int:
+        """日成长速度：本次实测 > BAIDUWP_DAILY_GROWTH > 历史记录。
+
+        今天已经签过的账号本次实测是 0，会自动回退到历史记录，不会误报成 0。
+        """
+        if self.observed_growth > 0:
+            self.registry.set_daily_growth(self.account_key, self.observed_growth)
+            log(f"日成长速度: {self.observed_growth}/天（本次实测）", "INFO", self.log_tag)
+            return self.observed_growth
+        if DAILY_GROWTH_ENV.isdigit() and int(DAILY_GROWTH_ENV) > 0:
+            log(f"日成长速度: {DAILY_GROWTH_ENV}/天（BAIDUWP_DAILY_GROWTH）", "INFO", self.log_tag)
+            return int(DAILY_GROWTH_ENV)
+        stored = self.registry.daily_growth(self.account_key)
+        log(f"日成长速度: {stored or '未知'}/天（历史记录；本次未获得成长值）",
+            "INFO", self.log_tag)
+        return stored
+
+    def membership_report(self) -> str:
+        """结果行：会员等级 / 成长值 / 距下一等级的预估天数。细节走日志。"""
+        level, value = self.userinfo()
+        if level is None:
+            log("会员信息: 未取到 level_info", "WARN", self.log_tag)
+            return ""
+        level, value = int(level), int(value or 0)
+        head = f"会员等级 SVIP{level}，成长值 {value}"
+        pairs = self.fetch_level_table()
+        nxt = next(((lv, th) for lv, th in pairs if lv > level), None)
+        if nxt is None:
+            if not pairs:
+                log("等级档位表不可用，本次不给出升级天数预估。可设 BAIDUWP_LEVEL_TABLE "
+                    "手工指定，形如 1:0,2:1000,5:10000", "WARN", self.log_tag)
+            else:
+                log(f"已是已知最高等级 SVIP{level}", "INFO", self.log_tag)
+            return head
+        next_level, threshold = nxt
+        need = max(0, threshold - value)
+        gain = self._daily_growth_rate()
+        log(f"升级预估: SVIP{level}/{value} -> SVIP{next_level} 门槛 {threshold}，"
+            f"还差 {need}，日增速 {gain or '未知'}", "INFO", self.log_tag)
+        if need <= 0:
+            return f"{head}；已达 SVIP{next_level} 门槛"
+        if not gain or gain <= 0:
+            return f"{head}；距 SVIP{next_level} 还差 {need}（日增速未知，暂不给天数）"
+        days = -(-need // gain)
+        return f"{head}；距 SVIP{next_level} 还差 {need}，约 {days} 天（+{gain}/天）"
+
+    # ---------- 主流程 ----------
+    def run(self):
+        """执行本账号全部任务。
+
+        返回：推送用结果行 list[str]（详细过程全部走 log() 进 stdout）。
+        """
+        self.push = []
+        try:
+            self.emit(self.growth_signin())
+            self.emit(self.answer_daily_question())
             try:
-                msg.append(self.pc_signin())
-                msg.append(self.taskcenter_signin())
-                msg.append(self.makeup_signin())
+                self.emit(self.pc_signin())
+                self.emit(self.taskcenter_signin())
+                self.emit(self.makeup_signin())
             except (requests.RequestException, RuntimeError) as e:
-                msg.append(f"积分/任务通道异常: {e.__class__.__name__}: {e}")
-            level, value = self.userinfo()
-            if level is not None:
-                msg.append(f"当前会员等级 SVIP{level}，成长值 {value}")
+                log(f"积分/任务通道异常: {e.__class__.__name__}: {e}", "ERR", self.log_tag)
+                self.emit(f"积分/任务通道: 异常（{e.__class__.__name__}）")
+            self.emit(self.membership_report())
         except requests.RequestException as e:
-            return f"网络请求异常: {e.__class__.__name__}: {e}"
+            log(f"网络请求异常: {e.__class__.__name__}: {e}", "ERR", self.log_tag)
+            self.push.append(f"执行失败: 网络异常 {e.__class__.__name__}")
         except RuntimeError as e:
-            return str(e)
-        return "\n".join(msg)
+            log(f"执行中断: {e}", "ERR", self.log_tag)
+            self.push.append(f"执行失败: {e}")
+        return self.push
 
 
 def load_cookies() -> list:
@@ -761,31 +1045,37 @@ def main():
         print("未配置 cookie 环境变量：BAIDUWP_COOKIE（或 BAIDUWP_COOKIE_1、_2 ...）")
         sys.exit(1)
     registry = DeviceRegistry(DEVICE_STATE_FILE)
-    results = []
+    results = []          # 仅结果行，进推送
     for i, cookie in enumerate(cookies, 1):
+        log(f"{'=' * 60}")
+        log(f"开始处理第 {i}/{len(cookies)} 个账号")
         panel = BaiduPan(cookie, index=i, registry=registry)
         username = panel.get_username()
         header = f"===== 账号 {i} 【{username}】=====" if username else f"===== 账号 {i} ====="
-        print(header)
+        log(f"账号昵称: {username or '(未取到)'}", "INFO", panel.log_tag)
         try:
-            msg = panel.run()
+            lines = panel.run()
         except Exception as e:  # noqa: BLE001
-            msg = f"执行异常: {e.__class__.__name__}: {e}"
-        print(msg, "\n")
-        if "HTTP 4" in msg or "已失效" in msg:
-            msg += "\n（提示：该账号 cookie 可能无效或已失效，请核对对应的环境变量）"
-        results.append(f"{header}\n{msg}")
+            log(f"执行异常: {e.__class__.__name__}: {e}", "ERR", panel.log_tag)
+            lines = [f"执行异常: {e.__class__.__name__}"]
+        lines = [line for line in lines if line]
+        log("---- 本账号结果（同时会进推送）----", "INFO", panel.log_tag)
+        for line in lines:
+            log(f"  {line}", "INFO", panel.log_tag)
+        log(f"账号 {i} 处理完毕，共 {len(lines)} 条结果", "INFO", panel.log_tag)
+        results.append(f"{header}\n" + "\n".join(lines))
         if i < len(cookies):
             gap = random.randint(3, 15)
-            print(f"等待 {gap}s 后处理下一个账号...", flush=True)
+            log(f"等待 {gap}s 后处理下一个账号...", "INFO", panel.log_tag)
             time.sleep(gap)
     registry.save()
-    # 青龙通知（存在 notify.py 则推送）
+    # 青龙通知（存在 notify.py 则推送）：只推结果行
     try:
         from notify import send  # type: ignore
         send("百度网盘签到", "\n\n".join(results))
+        log(f"推送完成，共 {len(results)} 个账号")
     except Exception:
-        pass
+        log("未找到 notify.py 或推送失败，跳过推送")
 
 
 if __name__ == "__main__":
