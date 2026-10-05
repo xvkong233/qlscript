@@ -100,7 +100,7 @@ def brief(value, limit=200):
     return text if len(text) <= limit else f"{text[:limit]}…(len={len(text)})"
 
 
-def structure_map(node, limit=220, max_depth=4):
+def structure_map(node, limit=90, max_depth=4):
     """把未知结构的 JSON 压成「路径 = 类型/样本」清单。
 
     用途：接口契约未知时，把 30KB 的原始 JSON 压成可贴回、可人工核对的一小段，
@@ -199,6 +199,10 @@ DEFAULT_DEVICE_POOL = ("5ACF9C71D2E84B0FA6C8D2E91F3A7B55|dailycheckin",)
 DEV_REPEAT_COOLDOWN = max(0, int(os.getenv("BAIDUWP_DEVICE_COOLDOWN", "43200") or 43200))
 DEVICE_STATE_TTL = 180 * 86400
 
+# App 侧 hybrid 客户端信息签名密钥（HybridActionClientInfo.AK）。
+# 官方客户端用它做设备-账号绑定签名: rchannel = MD5(AK + uid + time + channel)
+APP_CLIENT_AK = "1e34f40405355a992583c9d7b166cd39"
+
 # 等级预估：优先手工指定，其次向服务端要「等级↔成长值」档位表
 LEVEL_TABLE_ENV = os.getenv("BAIDUWP_LEVEL_TABLE", "").strip()
 DAILY_GROWTH_ENV = os.getenv("BAIDUWP_DAILY_GROWTH", "").strip()
@@ -217,6 +221,9 @@ def _parse_level_table(payload) -> list:
     结果还会做单调性与长度校验 —— 宁可返回空，也不给错数。
     """
     strict, loose = {}, {}
+    # 内层取门槛用的字段名
+    threshold_keys = ("value", "level_value", "growth_value", "need_value",
+                      "threshold", "min_value", "score")
 
     def add(bucket, level, value):
         try:
@@ -229,12 +236,22 @@ def _parse_level_table(payload) -> list:
     def walk(node):
         if isinstance(node, dict):
             low = {str(k).lower(): v for k, v in node.items()}
+            # 形态 A：同层显式字段 {"level": 3, "value": 10000}
             lv = next((low[k] for k in _LEVEL_KEYS if k in low), None)
             val = next((low[k] for k in _VALUE_KEYS if k in low), None)
             if lv is not None and val is not None and not isinstance(val, (dict, list)):
                 add(strict, lv, val)
             for k, v in low.items():
-                if not isinstance(v, (dict, list)):
+                if isinstance(v, dict):
+                    # 形态 C（实测 level_infos）：等级做键、门槛在内层字典的 value 字段
+                    #   {"1": {"name": "level1", "value": 0, ...}, "2": {...}}
+                    for tk in threshold_keys:
+                        cand = v.get(tk)
+                        if isinstance(cand, (int, float)) and not isinstance(cand, bool):
+                            add(strict, k, cand)
+                            break
+                else:
+                    # 形态 B：键值映射 {"1": 0, "2": 1000, ...}
                     add(loose, k, v)
             for v in node.values():
                 walk(v)
@@ -252,6 +269,29 @@ def _parse_level_table(payload) -> list:
         if len(pairs) >= 3 and all(a <= b for a, b in zip(values, values[1:])):
             return pairs
     return []
+
+
+# 每日增量取键优先级：年费(含自动续费/推荐官) > 季 > 月。
+# 实测 level_detail.daily_increase.svip 形如
+#   {vip2_1y: 30, vip2_1y_auto: 30, vip2_1y_tuijianguan: 30, vip2_3m: 20, vip2_1m: 20}
+#   vip 侧 {vip1_1y: 12, vip1_3m: 10, vip1_1m: 5}
+# 「年费」才是公开口径里的标准日增量（SVIP 30/天、VIP 12/天），故优先取年费档。
+_DAILY_INCREASE_KEYS = ("vip2_1y", "vip2_1y_auto", "vip2_1y_tuijianguan",
+                        "vip2_3m", "vip2_3m_auto", "vip2_1m", "vip2_1m_auto")
+
+
+def _numeric_leaves(node, bucket):
+    """把子树里的数值叶子（排除 bool）收集进 bucket。"""
+    if isinstance(node, dict):
+        for val in node.values():
+            _numeric_leaves(val, bucket)
+    elif isinstance(node, (list, tuple)):
+        for val in node:
+            _numeric_leaves(val, bucket)
+    elif isinstance(node, bool):
+        return
+    elif isinstance(node, (int, float)):
+        bucket.append(int(node))
 
 
 def _parse_daily_increase(payload) -> int:
@@ -274,18 +314,6 @@ def _parse_daily_increase(payload) -> int:
             for val in node:
                 walk(val)
 
-    def numeric_leaves(node, bucket):
-        if isinstance(node, dict):
-            for val in node.values():
-                numeric_leaves(val, bucket)
-        elif isinstance(node, (list, tuple)):
-            for val in node:
-                numeric_leaves(val, bucket)
-        elif isinstance(node, bool):
-            return
-        elif isinstance(node, (int, float)):
-            bucket.append(int(node))
-
     walk(payload)
     for branch in found:
         # 优先 svip 档（超级会员的每日增量最大，且脚本账号基本都是 SVIP）
@@ -296,11 +324,48 @@ def _parse_daily_increase(payload) -> int:
                     target = val
                     break
         bucket = []
-        numeric_leaves(target, bucket)
+        _numeric_leaves(target, bucket)
         bucket = [v for v in bucket if 1 <= v <= 500]
-        if bucket:
-            return max(bucket)
+        if not bucket:
+            continue
+        # 1) 按产品档位优先取键（年费 > 季 > 月）
+        if isinstance(target, dict):
+            low = {str(k).lower(): v for k, v in target.items()}
+            for key in _DAILY_INCREASE_KEYS:
+                cand = low.get(key)
+                if isinstance(cand, (int, float)) and not isinstance(cand, bool) \
+                        and 1 <= int(cand) <= 500:
+                    return int(cand)
+        # 2) 退化为该档最大值
+        return max(bucket)
     return 0
+
+
+def describe_daily_increase(payload) -> str:
+    """把 level_detail.daily_increase 的分档压成一行，便于日志核对。"""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if str(key).lower() == "daily_increase":
+                    found.append(val)
+                walk(val)
+        elif isinstance(node, (list, tuple)):
+            for val in node:
+                walk(val)
+
+    walk(payload)
+    for branch in found:
+        if isinstance(branch, dict):
+            parts = []
+            for tier, val in branch.items():
+                bucket = []
+                _numeric_leaves(val, bucket)
+                if bucket:
+                    parts.append(f"{tier}={max(bucket)}")
+            return ", ".join(parts)
+    return ""
 
 
 def _parse_level_table_expr(text: str) -> list:
@@ -753,8 +818,55 @@ class BaiduPan:
         return f"积分签到成功，当前积分余额 {inner.get('points_balance')}"
 
     # ---------- 4. 任务中心签到 ----------
-    def _taskcenter_signin_once(self, device: str) -> dict:
+    def _taskcenter_today_signed(self):
+        """读任务中心签到日历，判断今天是否已签。返回 True/False/None(取不到)。
+
+        实测 errno 9230 "signin error" 只出现在已连续签到天数更多的账号上，
+        高度疑似「今日任务中心已签到」。先查日历既能解释该错误码，也能省掉
+        后面整串无意义的设备尝试。
+        """
+        try:
+            cal = self._pc_api("/coins/taskcenter/signinlist", dict(self.task_base))
+        except (RuntimeError, requests.RequestException):
+            return None
+        if cal.get("errno") != 0:
+            return None
+        inner = cal.get("data") or {}
+        start, now = inner.get("start_time"), inner.get("date")
+        if not start or not now:
+            return None
+        today = (now - start) // 86400 + 1
+        for item in inner.get("signin_list") or []:
+            if isinstance(item, dict) and item.get("day") == today:
+                return bool(item.get("signed"))
+        return None
+
+    def _app_client_params(self, device: str) -> dict:
+        """按官方客户端 getClientInfo 组装设备绑定参数。
+
+        来源：com.baidu.netdisk.ui.webview.hybrid.ClientInfoHelper.getClientInfo()
+          rchannel = MD5(AK + uid + time + channel)，AK 取 HybridActionClientInfo.AK
+          rand / time 为 h5 侧 NetworkUtil.addRand 生成的请求随机数与时间戳
+        客观限制：sofire 反欺诈指纹 z = com.baidu.sofire.ac.FH.gz(context) 由本地
+        SDK 依据设备信号算出，脚本侧无法复现，因此不提供该字段。
+        """
+        ts = int(time.time())
+        params = {
+            "cuid": device, "devuid": device,
+            "time": str(ts),
+            "rand": str(random.randint(100000, 999999)),
+            "channel": TASK_BASE["channel"],
+        }
+        if self.uid:
+            params["rchannel"] = hashlib.md5(
+                f"{APP_CLIENT_AK}{self.uid}{ts}{TASK_BASE['channel']}".encode("utf-8")
+            ).hexdigest()
+        return params
+
+    def _taskcenter_signin_once(self, device: str, extra: dict = None) -> dict:
         params = {"cuid": device, "devuid": device, **TASK_BASE}
+        if extra:
+            params.update(extra)
         params.update({
             "task_id": "1666916321758720", "task_id_str": "1666916321758720",
             "task_from": "task_sys_daily", "is_growth": "1",
@@ -800,6 +912,11 @@ class BaiduPan:
           * param error 说明该设备没有登记记录，用 checkdevmp 复核并给出可执行指引；
           * 任何设备失败后写入冷却时间戳，下次运行不再无脑重撞同一台。
         """
+        # 先读服务端签到日历：今天已签就没必要再折腾设备（实测 errno 9230 即此情形）
+        signed = self._taskcenter_today_signed()
+        log(f"任务中心签到日历: today_signed={signed}", "INFO", self.log_tag)
+        if signed is True:
+            return "任务中心签到: 今日已签到"
         notes = []
         need_register = False
         for label, device in self._device_candidates():
@@ -858,10 +975,26 @@ class BaiduPan:
                 if is_new is not None:
                     self.registry.note_check(device, is_new)
                 log(f"  checkdevmp({label}) -> is_new_device={is_new}", "INFO", self.log_tag)
-                # 不论 checkdevmp 判定「新设备」与否，都补一次重试：
-                # 该接口是否带「设备登记」副作用尚无定论（App 侧 PointCenterApi.
-                # checkDeviceUnique 看起来只是查询），多打一次请求的代价远小于
-                # 漏签一天；若它确实有登记副作用，这一步就是签成的关键。
+                # 第一优先：按官方客户端流程补上设备绑定参数后再试一次。
+                # cuid/devuid 只是标识；App 的每个请求还会带 rchannel/rand/time，
+                # 其中 rchannel = MD5(AK + uid + time + channel) 才是把设备与账号
+                # 绑定的签名。缺它时服务端可能无从登记该设备 -> param error。
+                try:
+                    app_data = self._taskcenter_signin_once(
+                        device, self._app_client_params(device))
+                except (RuntimeError, requests.RequestException) as e:
+                    app_data = {"errno": -1, "error": str(e)}
+                app_err = str(app_data.get("error") or "")
+                log(f"  按客户端流程重试({label}) -> errno={app_data.get('errno')} "
+                    f"error={app_err or '无'}", "INFO", self.log_tag)
+                if app_data.get("errno") == 0:
+                    if device == self.device:
+                        self.registry.bind(self.account_key, device)
+                    days = (app_data.get("data") or {}).get("signin_days")
+                    return f"任务中心签到: 完成，累计 {days} 天"
+                if "bduss" in app_err.lower() or "login" in app_err.lower():
+                    return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+                # 第二优先：不带附加参数再试一次（覆盖 checkdevmp 有登记副作用的假设）
                 retry_data, retry_error = self._taskcenter_signin_device(device, tries=1)
                 if retry_data.get("errno") == 0:
                     if device == self.device:
@@ -1031,6 +1164,8 @@ class BaiduPan:
             base = _parse_daily_increase(config)
             if base > 0:
                 base_src = "服务端 level_detail.daily_increase"
+                detail = describe_daily_increase(config)
+                log(f"每日增量分档: {detail} -> 取 {base}/天", "INFO", self.log_tag)
         if base <= 0 and DAILY_GROWTH_ENV.isdigit() and int(DAILY_GROWTH_ENV) > 0:
             base, base_src = int(DAILY_GROWTH_ENV), "BAIDUWP_DAILY_GROWTH"
         if base <= 0:
