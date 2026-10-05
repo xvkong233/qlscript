@@ -32,6 +32,7 @@ cron: 30 8 * * *
   BAIDUWP_DEVICE_FILE     设备登记表落盘路径，默认脚本同目录
                           .baidu_taskcenter_device.json
   BAIDUWP_DEVICE_RESET    置 1 时清空登记的设备绑定（下次运行重新生成/指定）
+  BAIDUWP_DEVICE_COOLDOWN 设备风控冷却秒数，默认 43200（12 小时）
 
   获取方式见仓库 Wiki「Cookie 获取教程」。
   STOKEN 失效特征：推送中出现"任务中心签到失败: STOKEN 已失效"，
@@ -40,6 +41,7 @@ cron: 30 8 * * *
 依赖：requests（青龙 依赖管理 -> Python3 -> 安装 requests）
 """
 
+import gzip
 import hashlib
 import json
 import os
@@ -47,6 +49,7 @@ import random
 import re
 import sys
 import time
+import zlib
 
 import requests
 
@@ -67,53 +70,42 @@ TASK_BASE = {
     "app": "android", "version": "13.34.3", "versioncode": "4228",
 }
 
-# 任务中心签到的目标任务（task_sys_daily 每日签到）
-TASK_ID = "1666916321758720"
-TASK_FROM = "task_sys_daily"
-
-# ---------------------------------------------------------------------------
-# 任务中心设备登记（device registration）
+# 任务中心签到仅接受「已登记」设备，且一台设备不能同时服务多个账号。
 #
-# 逆向 App 13.30.0 得到的设备标识供给链（com/baidu/netdisk/ui/webview/hybrid/
-# ClientInfoHelper.getClientInfo + com/baidu/netdisk/startup/task/CUID3StartupTask）：
-#     cuid    = CommonParam.getCUID(context)          -> DeviceId.getCUID()
-#     devuid  = AppCommon.DEVUID                      -> PersonalConfig["deviceId"]
-#     CUID3StartupTask.initDeviceId(): 首次启动生成一次 deviceId 写入 PersonalConfig，
-#                                     之后每次启动都从配置里读回同一个值。
-# 结论：**设备标识是"安装维度一次性生成、永久复用"的稳定量，绝不随 cookie/登录态变化。**
+# 逆向 App 13.34.3 得到的设备标识供给链：
+#   bd_netdisk://com.baidu.netdisk.hybrid/getClientInfo
+#     -> com.baidu.netdisk.ui.webview.hybrid.ClientInfoHelper.getClientInfo()
+#          cuid   = CommonParam.getCUID(context)            (=> DeviceId.getCUID)
+#          devuid = com.baidu.netdisk.kernel.architecture.AppCommon.DEVUID
+#   com.baidu.netdisk.startup.task.CUID3StartupTask.initDeviceId():
+#          先从 PersonalConfig["deviceId"] 读回，有就直接复用；
+#          只有首次启动才 DeviceId.getCUID() 生成一次并写回配置。
+# 即：设备标识是「安装维度一次性生成、永久复用」的稳定量，与 cookie/登录态无关。
 #
-# 服务端侧（实测 + App 侧模型类）：
-#   * /coins/taskcenter/signin 在鉴权前先做参数校验，缺 clienttype/cuid/devuid/
-#     task_id/task_from 任一即 errno=2 "param error"；
-#   * 通过参数校验后再校验「账号 ↔ 设备」登记记录：
-#       未登记 -> "param error"；已被别的账号占用/短时间重复 -> "dev repeat"；
-#   * /coins/taskcenter/checkdevmp 即 App 的 PointCenterApi.checkDeviceUnique()，
-#     用来查询"本账号下这台设备是不是新的（未登记）"，errno==0 表示是新设备。
+# 服务端侧（实测）：
+#   /coins/taskcenter/signin 先做参数校验（缺 clienttype/cuid/devuid/task_id/
+#   task_from 任一即 errno=2 "param error"），通过后再查「账号↔设备」登记记录：
+#     未登记           -> "param error"
+#     已被别的账号占用 -> "dev repeat"
+#   /coins/taskcenter/checkdevmp 即 App 的 PointCenterApi.checkDeviceUnique()，
+#   errno==0 表示「本账号下该设备是新的（没有登记记录）」。
 #
-# 因此脚本必须做到两件事：
-#   ① 同一账号永远上报同一台设备（否则永远是新设备 -> param error）；
-#   ② 一台设备不要在同一天喂给不同账号（否则命中换号风控 -> dev repeat）。
+# 因此脚本必须保证：①同账号永远上报同一台设备；②同一天不把同一台设备喂给不同账号。
 # 本文件把 ① 的绑定关系与 ② 的冷却时间戳都持久化到磁盘。
-# ---------------------------------------------------------------------------
-
 DEVICE_STATE_FILE = os.getenv("BAIDUWP_DEVICE_FILE", "").strip() or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".baidu_taskcenter_device.json")
-
 # 备用「已在服务端登记」的设备池：仅在账号自有设备被拒时兜底，
 # 且运行期内每台最多服务一个账号（见 DeviceRegistry.acquire_shared）。
 DEFAULT_DEVICE_POOL = ("5ACF9C71D2E84B0FA6C8D2E91F3A7B55|dailycheckin",)
-
-# 设备风控冷却时长（秒）：dev repeat 期间该设备在服务端处于校验窗口
+# dev repeat 期间该设备处于服务端校验窗口，冷却时间内不再重撞
 DEV_REPEAT_COOLDOWN = max(0, int(os.getenv("BAIDUWP_DEVICE_COOLDOWN", "43200") or 43200))
-DEVICE_STATE_TTL = 180 * 86400          # 登记表条目有效期，避免无限膨胀
-
-# 补签方式: 1=SVIP 无门槛卡(每月5张) 2=做任务 3=金币
+DEVICE_STATE_TTL = 180 * 86400
 
 _DEVICE_RE = re.compile(r"^[A-Za-z0-9_.\-]{6,128}(\|[A-Za-z0-9_.\-]{1,64})?$")
 
 
-def _is_valid_device(device: str) -> bool:
-    """宽松校验设备标识：只要非空、无空白/分隔符冲突即可（服务端不校验形态）。"""
+def _is_valid_device(device) -> bool:
+    """宽松校验设备标识：非空、无空白与分隔符冲突即可（服务端并不校验形态）。"""
     return bool(device) and bool(_DEVICE_RE.match(device)) and "&" not in device
 
 
@@ -124,14 +116,8 @@ class DeviceRegistry:
 
         {
           "version": 1,
-          "accounts": {
-            "<account_key>": {"device": "...", "registered": true,
-                              "checked_at": 1759600000, "used_at": 1759600000}
-          },
-          "devices": {
-            "<device>": {"cooldown_until": 1759600000, "last_account": "uk:123",
-                         "last_used": 1759600000}
-          }
+          "accounts": {"<account_key>": {"device": "...", "used_at": 0}},
+          "devices":  {"<device>": {"cooldown_until": 0, "is_new_device": null}}
         }
     """
 
@@ -139,10 +125,6 @@ class DeviceRegistry:
         self.path = path
         self.data = {"version": 1, "accounts": {}, "devices": {}}
         self._run_shared_users = {}      # device -> account_key（仅本次进程运行期）
-        self._load()
-
-    # ---------- 读写 ----------
-    def _load(self):
         try:
             with open(self.path, encoding="utf-8") as f:
                 raw = json.load(f)
@@ -152,7 +134,7 @@ class DeviceRegistry:
                 self._gc()
         except FileNotFoundError:
             pass
-        except Exception:                # noqa: BLE001 状态文件损坏时不应阻塞签到
+        except Exception:                # noqa: BLE001 状态文件损坏不应阻塞签到
             pass
 
     def save(self):
@@ -162,7 +144,7 @@ class DeviceRegistry:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.path)
-        except Exception:                # noqa: BLE001 只读文件系统下静默降级为内存态
+        except Exception:                # noqa: BLE001 只读文件系统下降级为内存态
             pass
 
     def _gc(self):
@@ -176,18 +158,15 @@ class DeviceRegistry:
                     and now - float(item.get("last_used") or now) > DEVICE_STATE_TTL):
                 self.data["devices"].pop(dev, None)
 
-    # ---------- 账号设备绑定 ----------
     def device_for(self, account_key: str, derive):
-        """返回该账号已登记的设备；没有则用 derive() 现场派生一台并登记。"""
+        """返回该账号已登记的设备；没有则用 derive() 现场生成一台并登记。"""
         item = self.data["accounts"].get(account_key) or {}
         device = str(item.get("device") or "")
         if not _is_valid_device(device):
             device = derive()
             self.data["accounts"][account_key] = {
-                "device": device,
-                "registered": None,
-                "checked_at": 0,
-                "used_at": time.time(),
+                "device": device, "registered": None,
+                "checked_at": 0, "used_at": time.time(),
             }
             self.save()
         return device
@@ -199,7 +178,7 @@ class DeviceRegistry:
         self.save()
 
     def note_check(self, device: str, is_new: bool):
-        """记录 checkdevmp 的探测结果（errno==0 -> 服务端认为该设备是新设备）。"""
+        """记录 checkdevmp 探测结果（errno==0 -> 服务端认为该设备是新设备）。"""
         item = self.data["devices"].setdefault(device, {})
         item["is_new_device"] = bool(is_new)
         item["checked_at"] = time.time()
@@ -208,7 +187,6 @@ class DeviceRegistry:
     def is_known_new(self, device: str):
         return (self.data["devices"].get(device) or {}).get("is_new_device")
 
-    # ---------- 冷却与运行期独占 ----------
     def in_cooldown(self, device: str) -> bool:
         return float((self.data["devices"].get(device) or {}).get("cooldown_until") or 0) > time.time()
 
@@ -232,6 +210,8 @@ class DeviceRegistry:
             return True
         return owner == account_key
 
+# 补签方式: 1=SVIP 无门槛卡(每月5张) 2=做任务 3=金币
+
 
 class BaiduPan:
     def __init__(self, cookie: str, index: int = 1, registry: DeviceRegistry = None):
@@ -239,7 +219,6 @@ class BaiduPan:
         if "BDUSS=" not in cookie:
             cookie = f"BDUSS={cookie}"
         self.cookie = cookie
-        self.index = index
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -252,18 +231,18 @@ class BaiduPan:
             }
         )
         self.registry = registry or DeviceRegistry(DEVICE_STATE_FILE)
-        # 账号 uid 只有拿来做设备派生的稳定锚点，取不到就退化为 STOKEN/cookie 哈希
+        # 账号 uid 只用来做设备派生的稳定锚点，取不到则退化为 STOKEN/cookie 哈希
         self.uid = ""
         self.account_key = ""
         self.device = ""
         self._resolve_device_identity()
-        # 补签通道（signinlist / supptasklist / suppsignin）与签到通道共用同一台设备，
+        # 补签通道（signinlist/supptasklist/suppsignin）与签到通道共用同一台设备，
         # 保证服务端看到的「账号 ↔ 设备」绑定在所有任务中心接口上是一致的。
         self.task_base = {**TASK_BASE, "cuid": self.device, "devuid": self.device}
 
-    # ---------- 设备身份 ----------
+    # ---------- 任务中心设备身份 ----------
     def get_uid(self) -> str:
-        """取账号 uid(uk)。用 H5 同款 /api/loginstatus，兜底 xpan/nas；失败不阻塞主流程。"""
+        """取账号 uid(uk)，只作为设备派生的稳定锚点；失败不阻塞主流程。"""
         try:
             data = self._pc_api("/api/loginstatus", {"clienttype": "1"})
             uk = str((data.get("login_info") or {}).get("uk") or "")
@@ -291,16 +270,20 @@ class BaiduPan:
 
     @staticmethod
     def _legacy_device(cookie: str) -> str:
-        """升级前的老算法（md5(cookie)|前8位）：首次升级时沿用，保住已存在的服务端绑定。"""
+        """升级前的老算法（md5(cookie)|前8位）：首次登记时沿用，保住已存在的服务端绑定。"""
         digest = hashlib.md5(cookie.encode("utf-8")).hexdigest().upper()
         return f"{digest}|{digest[:8]}"
 
     @staticmethod
     def _derive_device(account_key: str) -> str:
         """按 App 设备标识形态生成：<32位大写HEX>|<8位小写HEX>。
-        由账号稳定身份派生，保证"同账号永远同一台设备"，且跨机器/重建状态文件可复现。"""
-        head = hashlib.md5(f"netdisk-taskcenter|{account_key}|cuid".encode("utf-8")).hexdigest().upper()
-        tail = hashlib.md5(f"netdisk-taskcenter|{account_key}|devuid".encode("utf-8")).hexdigest()[:8]
+
+        由账号稳定身份派生，保证同账号永远同一台设备，重建状态文件也能复现。
+        """
+        head = hashlib.md5(
+            f"netdisk-taskcenter|{account_key}|cuid".encode("utf-8")).hexdigest().upper()
+        tail = hashlib.md5(
+            f"netdisk-taskcenter|{account_key}|devuid".encode("utf-8")).hexdigest()[:8]
         return f"{head}|{tail}"
 
     def _resolve_device_identity(self):
@@ -319,17 +302,17 @@ class BaiduPan:
             self.device = override
         else:
             # 首次登记沿用老算法设备（老用户零回归，保住服务端可能已存在的绑定）；
-            # 若已确认老设备在服务端就是"新设备"（无登记记录），则改用由账号稳定身份
+            # 若已确认它在服务端就是"新设备"（没有登记记录），则改用由账号稳定身份
             # 派生的确定性设备 —— 它不随 cookie 变化，重建状态文件也能复现。
             # 无论走哪条，一旦落盘就被冻结，不再随 cookie 变化 ——
-            # 这是"设备能长期保持已登记"的前提。
+            # 这是设备能长期保持"已登记"状态的前提。
             legacy = self._legacy_device(self.cookie)
             fallback = (self._derive_device(self.account_key)
                         if self.registry.is_known_new(legacy) is True else legacy)
             self.device = self.registry.device_for(self.account_key, lambda: fallback)
 
     def _device_candidates(self):
-        """按优先级返回 [(标签, 设备)]：账号自有 → 环境变量指定 → 备用已登记池。"""
+        """按优先级返回 [(标签, 设备)]：账号自有 -> 环境变量指定 -> 备用已登记池。"""
         candidates = [("账号自有设备", self.device)]
         override = (os.getenv(f"BAIDUWP_DEVICE_{self.index}", "").strip()
                     or os.getenv("BAIDUWP_DEVICE", "").strip())
@@ -342,27 +325,59 @@ class BaiduPan:
                 candidates.append(("备用已登记设备", device))
         return candidates
 
+    @staticmethod
+    def _decode_json(resp, path: str) -> dict:
+        """解析响应 JSON（自行解压，兼容网关错误页谎报 Content-Encoding）。
+
+        百度网关的 404/5xx 错误页会给出 Content-Encoding: gzip，而 body 其实是明文 HTML。
+        requests 在 stream=False 时会在 session.get() 内部就把 body 读完并解压，
+        解码失败直接抛 ContentDecodingError —— 真正的 HTTP 状态码被完全掩盖
+        （表现为"网络请求异常"，看不到 404）。所以这里统一 stream=True 拿响应：
+        先判状态码，再自行按 Content-Encoding 解压，解压失败就按明文继续。
+        """
+        raw = b""
+        if resp.raw is not None:
+            try:
+                raw = resp.raw.read(decode_content=False)
+            except Exception:            # noqa: BLE001
+                raw = b""
+        encoding = (resp.headers.get("Content-Encoding") or "").strip().lower()
+        if encoding in ("gzip", "x-gzip"):
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:            # noqa: BLE001 网关谎报编码，按明文继续
+                pass
+        elif encoding == "deflate":
+            for fn in (zlib.decompress, lambda b: zlib.decompress(b, -zlib.MAX_WBITS)):
+                try:
+                    raw = fn(raw)
+                    break
+                except Exception:        # noqa: BLE001
+                    continue
+        try:
+            return json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            raise RuntimeError(
+                f"{path} 响应非 JSON（HTTP {resp.status_code}，"
+                f"body 前 80 字节: {raw[:80]!r}；cookie 可能已失效）")
+
     def _api_get(self, path: str, extra_params: dict, headers: dict = None) -> dict:
         params = dict(QUERY_PARAMS)
         params.update(extra_params)
         resp = self.session.get(API_BASE + path, params=params,
-                                headers=headers, timeout=TIMEOUT)
+                                headers=headers, timeout=TIMEOUT, stream=True)
         if resp.status_code != 200:
+            resp.close()
             raise RuntimeError(f"{path} 请求失败 HTTP {resp.status_code}")
-        try:
-            return resp.json()
-        except ValueError:
-            raise RuntimeError(f"{path} 响应非 JSON（cookie 可能已失效）")
+        return self._decode_json(resp, path)
 
     def _pc_api(self, path: str, params: dict) -> dict:
         resp = self.session.get(API_BASE + path, params=params,
-                                headers=PC_HEADERS, timeout=TIMEOUT)
+                                headers=PC_HEADERS, timeout=TIMEOUT, stream=True)
         if resp.status_code != 200:
+            resp.close()
             raise RuntimeError(f"{path} 请求失败 HTTP {resp.status_code}")
-        try:
-            return resp.json()
-        except ValueError:
-            raise RuntimeError(f"{path} 响应非 JSON（cookie 可能已失效）")
+        return self._decode_json(resp, path)
 
     @staticmethod
     def _not_logged_in(data: dict) -> bool:
@@ -390,34 +405,40 @@ class BaiduPan:
             raise RuntimeError("BDUSS 已失效，请重新获取 cookie")
         if data.get("error_code") != 0:
             return None, None
-        info = data.get("records") or data.get("data") or {}
-        if not isinstance(info, dict):
-            return None, None
-        return info.get("today_signed"), info.get("signed_cnt")
+        inner = data.get("data") or {}
+        return inner.get("today_signed"), inner.get("signed_cnt")
+
+    def signin(self):
+        """返回 (points, error_msg)。"""
+        data = self._api_get("/rest/2.0/membership/level", {"method": "signin"})
+        if self._not_logged_in(data):
+            raise RuntimeError("BDUSS 已失效，请重新获取 cookie")
+        if data.get("error_code") == 0:
+            return (data.get("result") or {}).get("points"), ""
+        error_msg = data.get("error_msg") or "未知错误"
+        if data.get("error_code") == 421001 or "repeat" in str(error_msg):
+            return None, "今日已签到"
+        return None, f"签到失败: {error_msg} (error_code={data.get('error_code')})"
 
     def growth_signin(self) -> str:
         today_signed, signed_cnt = self.get_sign_status()
         if today_signed:
-            return f"成长值今日已签到，已连续签到 {signed_cnt} 天"
-        data = self._api_get("/rest/2.0/membership/level", {"method": "signin"})
-        if self._not_logged_in(data):
-            raise RuntimeError("BDUSS 已失效，请重新获取 cookie")
-        if data.get("error_code") != 0:
-            return f"成长值签到失败: {data.get('error_msg') or data.get('error_code')}"
-        info = data.get("data") or {}
-        point = info.get("point") or info.get("score") or 0
-        return f"签到成功，获得 {point} 成长值，已连续签到 {info.get('signed_cnt')} 天"
+            return f"今日已签到，已连续签到 {signed_cnt} 天" if signed_cnt else "今日已签到"
+        points, error_msg = self.signin()
+        if points is not None:
+            msg = f"签到成功，获得 {points} 成长值"
+            if signed_cnt is not None:
+                msg += f"，已连续签到 {signed_cnt + 1} 天"
+            return msg
+        return error_msg or "签到失败"
 
     # ---------- 2. 每日答题 ----------
     def answer_daily_question(self) -> str:
-        data = self._api_get("/rest/2.0/membergrowv2/question",
-                             {"method": "getquestion"})
-        if self._not_logged_in(data):
-            raise RuntimeError("BDUSS 已失效，请重新获取 cookie")
-        info = data.get("data") or {}
-        ask_id = info.get("ask_id") or info.get("askid")
-        status = info.get("status")
-        answer = info.get("answer") or info.get("right_answer")
+        data = self._api_get("/act/v2/membergrowv2/getdailyquestion", {})
+        if data.get("errno") not in (0, None):
+            return ""
+        inner = data.get("data") or {}
+        ask_id, answer, status = inner.get("ask_id"), inner.get("answer"), inner.get("answer_status")
         if not ask_id:
             return ""
         if status == 1:
@@ -453,15 +474,15 @@ class BaiduPan:
     def _taskcenter_signin_once(self, device: str) -> dict:
         params = {"cuid": device, "devuid": device, **TASK_BASE}
         params.update({
-            "task_id": TASK_ID, "task_id_str": TASK_ID,
-            "task_from": TASK_FROM, "is_growth": "1",
+            "task_id": "1666916321758720", "task_id_str": "1666916321758720",
+            "task_from": "task_sys_daily", "is_growth": "1",
         })
         return self._pc_api("/coins/taskcenter/signin", params)
 
     def _taskcenter_checkdev(self, device: str) -> dict:
         """App 的 PointCenterApi.checkDeviceUnique()：GET /coins/taskcenter/checkdevmp。
 
-        用来向服务端确认"本账号下这台设备是不是新设备（即没有登记记录）"：
+        用来确认「本账号下这台设备是不是新设备（即没有登记记录）」：
         errno == 0 -> 服务端认为该设备是新的（未登记）。
         这一步同时把设备信息上报给任务中心，等价于 App 打开任务中心首页时做的事。
         """
@@ -488,11 +509,11 @@ class BaiduPan:
     def taskcenter_signin(self) -> str:
         """任务中心签到：按「账号自有设备 -> 环境变量指定 -> 备用已登记池」依次尝试。
 
-        关键点（对照 App 行为修正）：
+        对照 App 行为修正的三点：
           * 设备标识必须长期稳定（App 是一次生成永久复用），否则永远是"新设备"；
-          * dev repeat 只是该设备进入校验窗口，应换下一台设备继续，而不是直接放弃；
-          * param error 说明该设备在服务端没有登记记录，用 checkdevmp 复核并给出指引；
-          * 任何设备失败后写入冷却时间戳，下一次运行不再无脑重撞同一台。
+          * dev repeat 只是该设备进入服务端校验窗口，应换下一台继续，而不是直接放弃；
+          * param error 说明该设备没有登记记录，用 checkdevmp 复核并给出可执行指引；
+          * 任何设备失败后写入冷却时间戳，下次运行不再无脑重撞同一台。
         """
         notes = []
         need_register = False
@@ -508,7 +529,7 @@ class BaiduPan:
             print(f"  使用{label}签到...", flush=True)
             data, error = self._taskcenter_signin_device(device)
             if data.get("errno") == 0:
-                # 只有账号自有设备才回写绑定；备用池设备是公共兜底资源，
+                # 只有账号自有设备才回写绑定；备用池是公共兜底资源，
                 # 一旦永久绑定给某个账号，其它账号就再也用不上它了。
                 if device == self.device:
                     self.registry.bind(self.account_key, device)
@@ -525,16 +546,15 @@ class BaiduPan:
                 continue
 
             if "param error" in error:
-                # 该设备在服务端没有「账号↔设备」登记记录：先用 App 的 checkdevmp 复核上报，
+                # 该设备没有「账号↔设备」登记记录：先用 App 的 checkdevmp 复核上报，
                 # 再给它一次机会（部分账号在 checkdev 之后即可放行）。
                 is_new = None
                 try:
                     check = self._taskcenter_checkdev(device)
+                    check_err = str(check.get("error") or "")
                     if check.get("errno") == 0:
                         is_new = True
-                    elif check.get("errno") is not None and (
-                            "bduss" in str(check.get("error") or "").lower()
-                            or "login" in str(check.get("error") or "").lower()):
+                    elif "bduss" in check_err.lower() or "login" in check_err.lower():
                         return "任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"
                     else:
                         is_new = False
