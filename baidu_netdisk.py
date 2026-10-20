@@ -24,10 +24,18 @@ cron: 30 8 * * *
                    0~10 分钟再执行，使每天实际签到时间不同；设为 0 关闭。
                    手动调试时可设 0 立即执行。
 
-  --- 任务中心（积分中心）通道 ---
-  主链路已对齐 App 内 points-center H5（当前客户端唯一在用的签到链路）：
-      /coins/center/signininfo -> /coins/center/signinv2 -> /coins/center/signinlist
-  旧版 /coins/taskcenter/signin 当前客户端已不再调用，默认关闭。
+  --- 任务中心（任务系统）通道 ---
+  2026-10 真机抓包：金币乐园已下线，签到迁移到任务系统 H5
+  （/operation/activitys/taskSystem/main），页面打开时自动调用
+  /coins/taskcenter/signin，必须带 z / channel / offlinepackage 等完整客户端参数。
+  points-center（signinv2/center）仅作旧账号回退。
+
+  BAIDUWP_Z               sofire 设备指纹（默认内置 MuMu Android 15 抓包值；
+                          换设备后请用自己的抓包值覆盖）
+  BAIDUWP_Z_n             第 n 个账号专用 z（优先于 BAIDUWP_Z）
+  BAIDUWP_CHANNEL         分发渠道，默认 android_15_V2364A_bd-netdisk_1027840c
+  BAIDUWP_CHANNEL_n       第 n 个账号专用渠道（优先于 BAIDUWP_CHANNEL）
+  BAIDUWP_UA              WebView UA，默认内置 Android 15 wv UA
 
   BAIDUWP_DEVICE          指定本机使用的任务中心设备标识（全局，覆盖自动派生）
   BAIDUWP_DEVICE_n        第 n 个账号专用的设备标识（优先于 BAIDUWP_DEVICE）
@@ -183,6 +191,142 @@ TASK_BASE = {
     "app": "android", "version": "13.34.3", "versioncode": "4228",
 }
 
+# 2026-10 真机抓包（MuMu Android 15 / App 13.34.3）：任务系统 H5 实际发送的
+# /coins/taskcenter/signin 参数。缺 z/channel/offlinepackage 时服务端会在
+# 「真要签的那一天」返回 errno=2 param error（已签日会短路返回，不足以验证）。
+#   z            sofire 设备指纹 com.baidu.sofire.ac.FH.gz(context)
+#   channel      分发渠道，形如 android_15_<机型>_bd-netdisk_1027840c
+#   offlinepackage 离线包版本表（服务端参数校验用）
+# 三者均可用环境变量覆盖；z 与 channel 建议取自己真实设备的抓包值。
+TASK_CHANNEL = os.getenv("BAIDUWP_CHANNEL", "").strip() or     "android_15_V2364A_bd-netdisk_1027840c"
+SOFIRE_Z = os.getenv("BAIDUWP_Z", "").strip() or     ("3F6OTvsektth3-SLi2w11NlkNuROxENXQ4tcVJU9Y2bUfkGryNBdGUb7sk"
+     "ERYWTmmv2TVskuoIWo5J00p-4VLHA")
+TASK_UA = os.getenv("BAIDUWP_UA", "").strip() or     ("Mozilla/5.0 (Linux; Android 15; V2364A Build/V417IR; wv) "
+     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+     "Chrome/110.0.5481.154 Safari/537.36")
+TASK_OFFLINE_PACKAGE = {
+    "2004": {
+        "version": 93
+    },
+    "8002": {
+        "version": 21
+    },
+    "8102": {
+        "version": 81
+    },
+    "123075": {
+        "version": 23
+    },
+    "123422": {
+        "version": 77
+    },
+    "123437": {
+        "version": 9
+    },
+    "123441": {
+        "version": 25
+    },
+    "123443": {
+        "version": 19
+    },
+    "123465": {
+        "version": 31
+    },
+    "123600": {
+        "version": 12
+    },
+    "123700": {
+        "version": 25
+    },
+    "123750": {
+        "version": 21
+    },
+    "123781": {
+        "version": 9
+    },
+    "123782": {
+        "version": 5
+    },
+    "123787": {
+        "version": 4
+    },
+    "123818": {
+        "version": 66
+    },
+    "123890": {
+        "version": 30
+    },
+    "123941": {
+        "version": 15
+    },
+    "123942": {
+        "version": 12
+    },
+    "200013": {
+        "version": 24
+    },
+    "200017": {
+        "version": 27
+    },
+    "300001": {
+        "version": 43
+    },
+    "600001": {
+        "version": 304
+    },
+    "600002": {
+        "version": 70
+    },
+    "677531": {
+        "version": 3
+    },
+    "677533": {
+        "version": 10
+    },
+    "677536": {
+        "version": 3
+    },
+    "700001": {
+        "version": 11
+    },
+    "700022": {
+        "version": 4
+    },
+    "800002": {
+        "version": 29
+    },
+    "20240708": {
+        "version": 33
+    },
+    "20241211": {
+        "version": 4
+    },
+    "20250911": {
+        "version": 48
+    },
+    "20251117": {
+        "version": 32
+    },
+    "20260101": {
+        "version": 9
+    },
+    "20260316": {
+        "version": 3
+    },
+    "20260527": {
+        "version": 7
+    }
+}
+TASK_HEADERS = {
+    "User-Agent": TASK_UA,
+    "Referer": "https://pan.baidu.com/operation/activitys/taskSystem/main",
+    "Accept": "application/json, text/plain, */*",
+    "X-Requested-With": "XMLHttpRequest",
+}
+# 内置 z 对应的设备（MuMu 抓包）。若用自己的 BAIDUWP_DEVICE，请同时提供
+# 与之匹配的 BAIDUWP_Z；否则任务系统通道可能因 z/devuid 不匹配报 errno=2。
+TASK_DEVICE_BUILTIN = "BBC8B8DCC4790CFD232CD628652EFDED|VUWSHHV6D"
+
 # 任务中心设备标识：一次生成、长期复用，且不要同一天喂给多个账号。
 #
 # 逆向 App 13.34.3 得到的设备标识供给链：
@@ -195,16 +339,17 @@ TASK_BASE = {
 #          只有首次启动才 DeviceId.getCUID() 生成一次并写回配置。
 # 即：设备标识是「安装维度一次性生成、永久复用」的稳定量，与 cookie/登录态无关。
 #
-# 2026-10 复核（修正上一版结论）：
-#   App 全量 42 个 dex 中只有 /coins/taskcenter/signinlist（MyPointApi.signStatus）
-#   与 /coins/taskcenter/checkdevmp（PointCenterApi.checkDeviceUnique），
-#   **不存在** /coins/taskcenter/signin —— 当前客户端的签到在 points-center H5：
-#       goToSign()       -> /coins/center/signininfo?action=1&ptype=5
-#       getNewSignList() -> /coins/center/signinv2?action=1&ptype=5
-#                        -> /coins/center/signinlist?action=1&ptype=5
-#   实测无 cookie：signinv2 / signininfo / signinlist -> invalid bduss（鉴权前无风控门）；
-#   /coins/center/signin -> 8001（鉴权前 HTJError 风控门）。
-#   因此旧接口的 errno=2/9230 与「设备未登记」无关，不要再靠 App 手动登记去撞它。
+# 2026-10 真机抓包复核（修正前两版结论）：
+#   dex 里确实只有 /coins/taskcenter/signinlist 与 /coins/taskcenter/checkdevmp，
+#   但**任务系统 H5**（/operation/activitys/taskSystem/main）的 JS 会动态拼出
+#   /coins/taskcenter/signin 并在页面打开时自动签到 —— 所以只扫 dex 会漏掉它。
+#   该 H5 请求携带完整客户端参数：
+#       z / channel / cuid / devuid / version / versioncode / offlinepackage /
+#       themeinfo / rchannel / task_id / task_from / is_growth=0
+#   缺 z/channel/offlinepackage 时，未签到账号会得到 errno=2 param error
+#   （已签日服务端短路返回，看不出缺参数）。
+#   金币乐园（points-center）已下线，/coins/center/signin 的 8001 是活动下线的表现；
+#   /coins/center/signinv2 只对旧版/灰度账号有意义。
 #
 # 设备字段仍然保留并冻结：①H5 每个请求都会带 getClientInfo 的 cuid/devuid；
 # ②设备类风控码 9312/9302/9306 与 8001 仍按设备判定；③稳定设备能避免自造 dev repeat。
@@ -228,10 +373,9 @@ APP_CLIENT_AK = "1e34f40405355a992583c9d7b166cd39"
 # 因此这里的 errno=2/9230 不能解读成「设备未登记」—— 它们只是旧接口的
 # 参数/任务契约已经失效（服务端不再为这个入口维护 task_id/task_from）。
 TASKCENTER_ERRNO = {
-    2: "旧版 taskcenter 签到的参数/任务契约已失效（当前客户端已不调用该接口），"
-       "与设备是否登记无关",
-    9230: "旧版 taskcenter 签到接口的通用错误（同样与设备登记无关；当前客户端"
-          "已不再调用该接口）",
+    2: "任务系统通道参数校验失败（缺 z/channel/offlinepackage 等客户端参数，"
+       "或客户端版本/渠道不匹配），与设备是否登记无关",
+    9230: "任务系统通道通用错误（多为当日已签或活动状态异常）",
     9312: "设备重复：同一台设备正在服务其它账号，或处于服务端校验窗口",
 }
 
@@ -632,8 +776,8 @@ class BaiduPan:
         self.device = ""
         self._resolve_device_identity()
         # 补签通道（signinlist/supptasklist/suppsignin）与签到通道共用同一台设备，
-        # 保证服务端看到的「账号 ↔ 设备」绑定在所有任务中心接口上是一致的。
-        self.task_base = {**TASK_BASE, "cuid": self.device, "devuid": self.device}
+        # 并统一带上任务系统 H5 的完整客户端参数（z/channel/offlinepackage…）。
+        self.task_base = self._taskcenter_params(self.device)
         log(f"账号识别: uid={self.uid or '(未取到)'} account_key={self.account_key} "
             f"cookie=[BDUSS/STOKEN 已隐藏]", "INFO", self.log_tag)
         log(f"任务中心设备: {self.device}（来源: "
@@ -842,8 +986,14 @@ class BaiduPan:
 
     def _pc_api(self, path: str, params: dict, headers: dict = None) -> dict:
         if headers is None:
-            # points-center H5 通道用移动端 UA + 页面 Referer；其余沿用 PC 客户端头
-            headers = CENTER_HEADERS if path.startswith("/coins/center/") else PC_HEADERS
+            if path.startswith("/coins/taskcenter/"):
+                # 任务系统 H5（taskSystem/main）的 UA/Referer 与 points-center 不同
+                headers = TASK_HEADERS
+            elif path.startswith("/coins/center/"):
+                # points-center H5 通道用移动端 UA + 页面 Referer
+                headers = CENTER_HEADERS
+            else:
+                headers = PC_HEADERS
         return self._http_get(path, params, headers)
 
     @staticmethod
@@ -996,18 +1146,28 @@ class BaiduPan:
         return self._api_get("/coins/taskcenter/signin", params)
 
     def _taskcenter_today_signed(self):
-        """读旧版任务中心签到日历，判断今天是否已签。True/False/None(取不到)。
+        """读任务系统签到日历，判断今天是否已签。True/False/None(取不到)。
 
-        仅用于 BAIDUWP_TASKCENTER_LEGACY 兼容链路。当前客户端签到状态请走
-        _center_sign_state()（H5 signininfo / center signinlist）。
+        任务系统 H5 的 /coins/taskcenter/signinlist 返回 signed_today /
+        signin_days / day / signin_list，是当前签到状态的权威来源。
         """
+        params = self._taskcenter_params(self.device)
+        params.update({
+            "task_id": "1666916321758720", "task_id_str": "1666916321758720",
+            "task_from": "task_sys_daily", "is_growth": "0",
+        })
         try:
-            cal = self._pc_api("/coins/taskcenter/signinlist", dict(self.task_base))
+            cal = self._pc_api("/coins/taskcenter/signinlist", params)
         except (RuntimeError, requests.RequestException):
             return None
         if cal.get("errno") != 0:
             return None
         inner = cal.get("data") or {}
+        # 任务系统日历的权威字段
+        if inner.get("signed_today") is not None:
+            return bool(inner.get("signed_today"))
+        if inner.get("signed") is not None:
+            return bool(inner.get("signed"))
         start, now = inner.get("start_time"), inner.get("date")
         if not start or not now:
             return None
@@ -1039,14 +1199,45 @@ class BaiduPan:
             ).hexdigest()
         return params
 
+    def _task_z(self) -> str:
+        """按账号取 sofire z：BAIDUWP_Z_n > BAIDUWP_Z > 内置抓包值。"""
+        return (os.getenv(f"BAIDUWP_Z_{self.index}", "").strip()
+                or os.getenv("BAIDUWP_Z", "").strip() or SOFIRE_Z)
+
+    def _task_channel(self) -> str:
+        """按账号取 channel：BAIDUWP_CHANNEL_n > BAIDUWP_CHANNEL > 内置抓包值。"""
+        return (os.getenv(f"BAIDUWP_CHANNEL_{self.index}", "").strip()
+                or os.getenv("BAIDUWP_CHANNEL", "").strip() or TASK_CHANNEL)
+
+    def _taskcenter_params(self, device: str) -> dict:
+        """任务系统 H5（taskSystem/main）的完整客户端参数（App 13.34.3 抓包）。"""
+        ts = int(time.time())
+        channel = self._task_channel()
+        return {
+            "z": self._task_z(),
+            "clienttype": "1",
+            "channel": channel,
+            "cuid": device,
+            "devuid": device,
+            "version": TASK_BASE["version"],
+            "versioncode": TASK_BASE["versioncode"],
+            "offlinepackage": json.dumps(TASK_OFFLINE_PACKAGE,
+                                         separators=(",", ":")),
+            "themeinfo": "0",
+            "app": "android",
+            "rchannel": hashlib.md5(
+                f"{APP_CLIENT_AK}{self.uid or '0'}{ts}{channel}".encode("utf-8")
+            ).hexdigest(),
+        }
+
     def _taskcenter_signin_once(self, device: str, extra: dict = None) -> dict:
-        """旧版原生 /coins/taskcenter/signin（当前客户端已不调用，仅兼容链路）。"""
-        params = {"cuid": device, "devuid": device, "ptype": CENTER_PTYPE, **TASK_BASE}
+        """任务系统 H5 当前通道：GET /coins/taskcenter/signin（全量客户端参数）。"""
+        params = self._taskcenter_params(device)
         if extra:
             params.update(extra)
         params.update({
             "task_id": "1666916321758720", "task_id_str": "1666916321758720",
-            "task_from": "task_sys_daily", "is_growth": "1",
+            "task_from": "task_sys_daily", "is_growth": "0",
         })
         return self._pc_api("/coins/taskcenter/signin", params)
 
@@ -1058,7 +1249,7 @@ class BaiduPan:
         这一步同时把设备信息上报给任务中心，等价于 App 打开任务中心首页时做的事。
         """
         return self._pc_api("/coins/taskcenter/checkdevmp",
-                            {"cuid": device, "devuid": device, **TASK_BASE})
+                            self._taskcenter_params(device))
 
     def _probe_device_register(self, label: str, device: str):
         """问服务端：这台设备在本账号下是不是「新设备」（无登记记录）。
@@ -1346,23 +1537,68 @@ class BaiduPan:
     def taskcenter_signin(self) -> str:
         """任务中心（积分中心）签到：完整复刻官方 H5 客户端链路。
 
-        逆向依据（App 13.34.3 + points-center H5）：
-          * 全量 42 个 dex 里只有 "/coins/taskcenter/signinlist" 和
-            "/coins/taskcenter/checkdevmp"，**不存在** "/coins/taskcenter/signin"
-            —— 当前客户端根本不调这个旧接口，它的 errno=2 不是「设备未登记」。
-          * H5 的权威状态是 /coins/center/home 的 data.signed / data.signin_version：
-              signin_version=0 旧版  -> goToSign()       -> /coins/center/signin
-              signin_version=1 灰度  -> AB 命中才走新版，否则同上
-              signin_version=2 新版  -> getNewSignList() -> /coins/center/signinv2
-                                                          -> /coins/center/signinlist
-          * 实测 /coins/center/signin 有「鉴权前」风控门（无 cookie 也回 8001），
-            signinv2 只对新签活动开放，旧版账号硬打会返回 35100「获取amis配置失败」。
+        逆向依据（App 13.34.3 真机抓包，2026-10）：
+          * 金币乐园（points-center）已下线，资产迁移到「任务系统」；
+            任务系统 H5（/operation/activitys/taskSystem/main）打开时会自动签到，
+            它调用的仍是 GET /coins/taskcenter/signin，但必须带完整客户端参数：
+              z / channel / cuid / devuid / version / versioncode /
+              offlinepackage / themeinfo / rchannel / task_id / task_from /
+              is_growth=0
+            缺 z/channel/offlinepackage 时，未签到的账号会得到 errno=2 param error
+            （已签日服务端会短路返回，因此看不出缺参数）。
+          * 任务系统日历 /coins/taskcenter/signinlist 返回 signed_today /
+            signin_days / day / signin_list，是当前签到状态的权威来源。
+          * points-center 的 signinv2/center 通道仅作旧账号回退；金币乐园活动已下线。
 
-        因此：home 已签 -> 直接返回；version=2 -> signinv2；version=0/1 或
-        signinv2 失败 -> /coins/center/signin（8001 风控门）；旧原生 taskcenter
-        接口需 BAIDUWP_TASKCENTER_LEGACY=1 才尝试。
+        因此：先走任务系统通道；失败再回退 points-center（signinv2/center）。
         """
         self._warmup_session()
+
+        # 1) 任务系统 H5 当前通道（App 13.34.3 实测：taskSystem/main 打开即签到）
+        #    真机抓包确认它调用 /coins/taskcenter/signin，且必须带 z/channel/
+        #    offlinepackage 等完整客户端参数；缺参数会在「真要签的那天」报 errno=2。
+        tc_signed = self._taskcenter_today_signed()
+        log(f"任务系统签到日历: today_signed={tc_signed}", "INFO", self.log_tag)
+        if tc_signed is True:
+            return "任务中心签到: 今日已签到"
+
+        tc_data, tc_error = self._taskcenter_signin_device(self.device, tries=1)
+        tc_errno = tc_data.get("errno")
+        tc_msg = str(tc_data.get("error") or "")
+        log(f"  任务系统通道 signin -> errno={tc_errno} error={tc_msg or '无'}",
+            "INFO", self.log_tag)
+        if tc_errno == 0:
+            inner = tc_data.get("data") or {}
+            days = inner.get("signin_days")
+            suffix = f"，已连续签到 {days} 天" if days else ""
+            if inner.get("signed") == 1:
+                return f"任务中心签到: 今日已签到{suffix}"
+            return f"任务中心签到: 完成{suffix}"
+        if tc_errno == -6 or self._is_login_error(tc_msg):
+            return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+
+        # 内置 z 来自 MuMu 设备；若账号自有设备与 z 不配对，用内置设备再试一次。
+        # （用户显式提供 BAIDUWP_Z 时说明 z 已与自己的设备匹配，不再替换设备）
+        if (tc_errno in (2, 9230) and self.device != TASK_DEVICE_BUILTIN
+                and not os.getenv("BAIDUWP_Z", "").strip()
+                and not os.getenv(f"BAIDUWP_Z_{self.index}", "").strip()):
+            log(f"  内置 z 配对设备重试: {TASK_DEVICE_BUILTIN}", "WARN", self.log_tag)
+            tc_data, tc_error = self._taskcenter_signin_device(
+                TASK_DEVICE_BUILTIN, tries=1)
+            tc_errno = tc_data.get("errno")
+            tc_msg = str(tc_data.get("error") or "")
+            log(f"  任务系统通道(内置设备) -> errno={tc_errno} "
+                f"error={tc_msg or '无'}", "INFO", self.log_tag)
+            if tc_errno == 0:
+                inner = tc_data.get("data") or {}
+                days = inner.get("signin_days")
+                suffix = f"，已连续签到 {days} 天" if days else ""
+                if inner.get("signed") == 1:
+                    return f"任务中心签到: 今日已签到{suffix}"
+                return f"任务中心签到: 完成{suffix}"
+        tc_note = f"任务系统通道({CENTER_ERRNO.get(tc_errno, tc_msg or tc_errno)})"
+
+        # 2) 回退：points-center 通道（旧版/灰度账号仍可能走这里）
         state = self._center_sign_state()
         if state.get("invalid"):
             log("任务中心签到失败: 服务端返回 bduss 错误，cookie 缺少有效 STOKEN",
@@ -1373,7 +1609,7 @@ class BaiduPan:
             suffix = f"，已连续签到 {days} 天" if days else ""
             return f"任务中心签到: 今日已签到{suffix}"
 
-        notes = []
+        notes = [tc_note]
         last_errno, last_error = None, ""
         version = state.get("version")
         version_name = {0: "旧版", 1: "灰度(CAN_BE_NEW)", 2: "新版"}.get(version, "未知")
@@ -1449,13 +1685,12 @@ class BaiduPan:
         log(f"任务中心签到失败明细: {detail}", "ERR", self.log_tag)
         if hint:
             log(f"  错误码解读(errno={last_errno}): {hint}", "ERR", self.log_tag)
-        log("  注意：当前客户端已不调用 /coins/taskcenter/signin（APK 内无该字面量），"
-            "旧接口的 errno=2 与「设备未登记」无关；不要再按「去 App 里手动登记设备」"
-            "处理", "ERR", self.log_tag)
+        log("  说明：任务系统通道要求完整客户端参数（z/channel/offlinepackage 等）；"
+            "errno=2 表示这些参数未通过校验，与「设备未登记」无关", "ERR", self.log_tag)
         return f"任务中心签到: 失败（{detail}）"
 
     def _taskcenter_signin_legacy(self) -> str:
-        """旧版原生通道兜底（当前客户端已不调用，仅 BAIDUWP_TASKCENTER_LEGACY=1 启用）。
+        """任务系统通道失败后的旧兼容链路（仅 BAIDUWP_TASKCENTER_LEGACY=1 启用）。
 
         保留原设备降级逻辑：
           * 设备标识必须长期稳定（App 是一次生成永久复用）；
