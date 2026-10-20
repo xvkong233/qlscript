@@ -1219,7 +1219,7 @@ class BaiduPan:
                 if errno == -6 or self._is_login_error(error):
                     invalid = True
                 log(f"  签到状态({name}) -> errno={errno} error={error or '无'}",
-                    "DEBUG", self.log_tag)
+                    "INFO", self.log_tag)
                 continue
             info = self._parse_sign_calendar(data)
             info["source"] = name
