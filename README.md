@@ -31,7 +31,7 @@
 
 > STOKEN 说明：成长值/答题/PC 积分三个通道仅凭 BDUSS 即可运行；任务中心签到与补签需要 STOKEN。STOKEN 失效时推送会提示"任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"，其余功能不受影响，重新取一次 cookie 更新环境变量即可（频率约为月级）。
 
-**任务中心签到通道说明**：2026-10 复核确认——App 13.34.3 全量 42 个 dex 中已无 `/coins/taskcenter/signin` 字面量，当前客户端签到走 App 内 points-center H5：`/coins/center/signininfo` → `/coins/center/signinv2` → `/coins/center/signinlist`。脚本已按这条真实链路执行；旧接口只在 `BAIDUWP_TASKCENTER_LEGACY=1` 时兼容尝试。设备标识仍会冻结复用（`BAIDUWP_DEVICE_n` / `BAIDUWP_DEVICE_POOL` 可手工指定），用于 `9312/8001` 这类账号/设备风控的降级；历史上把 `errno=2` 解读成「设备未登记」的结论已被推翻。
+**任务中心签到通道说明**：2026-10 复核确认——App 13.34.3 全量 42 个 dex 中已无 `/coins/taskcenter/signin` 字面量，当前签到在 points-center H5。H5 的权威状态是 `/coins/center/home` 的 `signed` / `signin_version`：`signed=1` 直接算今日已签；`signin_version=2`（新版）走 `/coins/center/signinv2` → `/coins/center/signinlist`；`signin_version=0/1`（旧版/灰度）走 `/coins/center/signin`，该接口有鉴权前 `8001` 风控门，脚本侧没有 sofire 指纹 `z` 时无法通过。脚本已按版本分流，并在会话开始时按 H5 顺序预热（首页 → points 页 → AMIS 配置）以接住服务端下发的 `BAIDUID/PANWEB` 等 cookie；旧原生接口只在 `BAIDUWP_TASKCENTER_LEGACY=1` 时尝试。设备标识仍会冻结复用（`BAIDUWP_DEVICE_n` / `BAIDUWP_DEVICE_POOL` 可手工指定），用于 `9312/8001` 这类账号/设备风控的降级；历史上把 `errno=2` 解读成「设备未登记」的结论已被推翻。
 
 ### 王者营地签到（王者 + 万象棋双渠道）
 

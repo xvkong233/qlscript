@@ -248,6 +248,8 @@ CENTER_ERRNO = {
     9302: "手机号重复：同一手机号下多账号",
     9306: "账号未绑定手机号",
     9312: "设备重复：同一设备多账号",
+    35100: "获取 AMIS 配置失败（新签到活动未对当前客户端开放/配置缺失，"
+           "说明该账号不该走 signinv2）",
     35103: "token 校验失败",
     35104: "token 与账号不匹配",
 }
@@ -617,9 +619,12 @@ class BaiduPan:
                 "Referer": "https://pan.baidu.com/wap/svip/growth/task",
                 "Accept": "application/json, text/plain, */*",
                 "X-Requested-With": "XMLHttpRequest",
-                "Cookie": cookie,
             }
         )
+        # 不要写死 Cookie 头：那样服务端下发的 Set-Cookie（BAIDUID/PANWEB/BDCLND…）
+        # 永远发不回去，H5 的会话上下文就断了。
+        self._load_cookies_into_jar(cookie)
+        self._warmed = False
         self.registry = registry or DeviceRegistry(DEVICE_STATE_FILE)
         # 账号 uid 只用来做设备派生的稳定锚点，取不到则退化为 STOKEN/cookie 哈希
         self.uid = ""
@@ -634,6 +639,54 @@ class BaiduPan:
         log(f"任务中心设备: {self.device}（来源: "
             f"{'环境变量指定' if self.device != self._legacy_device(self.cookie) else '登记表/老算法'}）",
             "INFO", self.log_tag)
+
+    def _load_cookies_into_jar(self, cookie: str):
+        """把 cookie 串放进 requests 的 CookieJar（而不是写死 Cookie 头）。
+
+        H5 页面加载时会从服务端拿到 BAIDUID / PANWEB 等 cookie，后续请求
+        要能把它们带回去；写死 Cookie 头会让这些 Set-Cookie 永远失效。
+        """
+        jar = self.session.cookies
+        for part in re.split(r"[;\n]+\s*", cookie):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name, value = name.strip(), value.strip()
+            if not name:
+                continue
+            try:
+                jar.set(name, value, domain=".baidu.com", path="/")
+            except Exception:                # noqa: BLE001 单条坏 cookie 不阻塞
+                pass
+
+    def _warmup_session(self):
+        """按 H5 页面加载顺序预热会话：首页 -> points 页 -> AMIS 配置。
+
+        作用：拿到服务端下发的 BAIDUID/PANWEB 等 cookie，并建立活动配置上下文。
+        旧的「写死 Cookie 头」实现拿不到这些 Set-Cookie，风控侧看到的会话不完整。
+        """
+        if getattr(self, "_warmed", False):
+            return
+        self._warmed = True
+        session = getattr(self, "session", None)
+        if session is not None:
+            for url in ("https://pan.baidu.com/",
+                        "https://pan.baidu.com/operation/activitys/points/main"):
+                try:
+                    resp = session.get(url, timeout=TIMEOUT, stream=True,
+                                       headers=CENTER_HEADERS)
+                    resp.close()
+                except requests.RequestException as e:
+                    log(f"  预热 {url} 失败: {e.__class__.__name__}: {e}",
+                        "DEBUG", self.log_tag)
+            log_debug(f"  会话 cookie: {sorted(session.cookies.keys())}",
+                      self.log_tag)
+        try:
+            conf = self._pc_api("/act/api/conf", {"conf_key": "pointCenterBase2"})
+            log_debug(f"  AMIS 配置预热 -> errno={conf.get('errno')}", self.log_tag)
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"  AMIS 配置预热失败: {e.__class__.__name__}: {e}",
+                "DEBUG", self.log_tag)
 
     def emit(self, line: str) -> str:
         """登记一条「结果行」：进推送列表，同时在日志里留档。"""
@@ -1086,12 +1139,13 @@ class BaiduPan:
         """
         inner = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(inner, dict):
-            return {"signed": None, "days": None}
+            return {"signed": None, "days": None, "version": None}
         state = inner.get("signin_state")
         state = state if isinstance(state, dict) else {}
         signed = None
+        # "signed" 是 /coins/center/home 的字段（H5 就是用它决定 signToday）
         for key in ("SignedToday", "signed_today", "today_signined",
-                    "todaySignined", "is_signin"):
+                    "todaySignined", "is_signin", "signed"):
             if key in state:
                 signed = bool(state.get(key))
                 break
@@ -1123,7 +1177,15 @@ class BaiduPan:
                 if days is None:
                     days = sum(1 for it in items if isinstance(it, dict)
                                and (it.get("signed") or it.get("is_signin")))
-        return {"signed": signed, "days": days}
+        version = None
+        for key in ("signin_version", "signinVersion", "sign_version"):
+            val = inner.get(key)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, int) or (isinstance(val, str) and val.lstrip("-").isdigit()):
+                version = int(val)
+                break
+        return {"signed": signed, "days": days, "version": version}
 
     def _center_sign_state(self, device: str = "") -> dict:
         """读签到状态，顺序对齐客户端（signininfo -> signinlist -> 原生日历）。
@@ -1132,15 +1194,21 @@ class BaiduPan:
               "invalid": bool}；invalid 表示 cookie 失效（取不到结论）。
         """
         probes = (
-            ("H5 signininfo", "/coins/center/signininfo"),
-            ("H5 signinlist", "/coins/center/signinlist"),
-            ("App signinlist", "/coins/taskcenter/signinlist"),
+            # H5 的权威状态源：getHomeInfo() 用 data.signed 决定 signToday，
+            # 用 data.signin_version 决定走新签到(signinv2)还是旧签到(center/signin)
+            ("H5 home", "/coins/center/home", {"ptype": CENTER_PTYPE}),
+            ("H5 signininfo", "/coins/center/signininfo",
+             {"action": CENTER_ACTION, "ptype": CENTER_PTYPE}),
+            ("H5 signinlist", "/coins/center/signinlist",
+             {"action": CENTER_ACTION, "ptype": CENTER_PTYPE}),
+            ("App signinlist", "/coins/taskcenter/signinlist",
+             {"ptype": CENTER_PTYPE}),
         )
         invalid = False
-        for name, path in probes:
+        version = None
+        for name, path, params in probes:
             try:
-                data = self._center_api(path, {"action": CENTER_ACTION,
-                                               "ptype": CENTER_PTYPE}, device)
+                data = self._center_api(path, params, device)
             except (RuntimeError, requests.RequestException) as e:
                 log(f"  签到状态({name}) 读取失败: {e.__class__.__name__}: {e}",
                     "WARN", self.log_tag)
@@ -1157,11 +1225,45 @@ class BaiduPan:
             info["source"] = name
             # 能拿到 200+errno=0 就说明会话有效，不因前一个探针的 -6 误判为失效
             info["invalid"] = False
+            if info["version"] is not None:
+                version = info["version"]
             log(f"  签到状态({name}) -> today_signed={info['signed']} "
-                f"连续天数={info['days']}", "INFO", self.log_tag)
+                f"连续天数={info['days']} 签到版本={info['version']}",
+                "INFO", self.log_tag)
             if info["signed"] is not None or info["days"] is not None:
+                if info["version"] is None:
+                    info["version"] = version
                 return info
-        return {"signed": None, "days": None, "source": "未取到", "invalid": invalid}
+        return {"signed": None, "days": None, "version": version,
+                "source": "未取到", "invalid": invalid}
+
+    def _dump_center_home(self, label: str):
+        """失败时把 /coins/center/home 的关键字段与全文打进日志/落盘。
+
+        H5 的 signToday 与 signin_version 都来自这个接口：它是判断「今天该不该签、
+        该走 signinv2 还是 center/signin」的权威来源。
+        """
+        try:
+            home = self._center_api("/coins/center/home", {"ptype": CENTER_PTYPE})
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"  center/home 读取失败: {e.__class__.__name__}: {e}",
+                "WARN", self.log_tag)
+            return
+        if home.get("errno") != 0:
+            log(f"  center/home errno={home.get('errno')} "
+                f"error={home.get('error') or home.get('errmsg')}",
+                "WARN", self.log_tag)
+            return
+        inner = home.get("data") or {}
+        keys = ("signed", "signin_version", "signin_days", "signin_double_award",
+                "received_sign_reward", "next_sign_reward_days", "new_player",
+                "is_newbie", "points_balance", "inactive", "can_reissue")
+        summary = {k: inner.get(k) for k in keys if k in inner}
+        log(f"  center/home 关键字段({label}): {brief(summary, 320)}",
+            "INFO", self.log_tag)
+        path = dump_json(home, "center_home_dump.json")
+        if path:
+            log(f"  center/home 全文已落盘: {path}", "INFO", self.log_tag)
 
     @staticmethod
     def _is_login_error(text) -> bool:
@@ -1192,8 +1294,13 @@ class BaiduPan:
         """
         device = device or self.device
         days = None
+        # 客户端 getNewSignList() 的第二步：签完回读 /coins/center/signinlist
         try:
-            days = self._center_sign_state(device).get("days")
+            cal = self._center_api("/coins/center/signinlist",
+                                   {"action": CENTER_ACTION, "ptype": CENTER_PTYPE},
+                                   device)
+            if cal.get("errno") == 0:
+                days = self._parse_sign_calendar(cal).get("days")
         except (RuntimeError, requests.RequestException):
             pass
         inner = data.get("data") if isinstance(data, dict) else None
@@ -1243,17 +1350,19 @@ class BaiduPan:
           * 全量 42 个 dex 里只有 "/coins/taskcenter/signinlist" 和
             "/coins/taskcenter/checkdevmp"，**不存在** "/coins/taskcenter/signin"
             —— 当前客户端根本不调这个旧接口，它的 errno=2 不是「设备未登记」。
-          * 真正的签到在 points-center H5：
-              goToSign()       -> GET /coins/center/signininfo?action=1&ptype=5
-              getNewSignList() -> GET /coins/center/signinv2?action=1&ptype=5
-                              -> GET /coins/center/signinlist?action=1&ptype=5
+          * H5 的权威状态是 /coins/center/home 的 data.signed / data.signin_version：
+              signin_version=0 旧版  -> goToSign()       -> /coins/center/signin
+              signin_version=1 灰度  -> AB 命中才走新版，否则同上
+              signin_version=2 新版  -> getNewSignList() -> /coins/center/signinv2
+                                                          -> /coins/center/signinlist
           * 实测 /coins/center/signin 有「鉴权前」风控门（无 cookie 也回 8001），
-            而 signinv2 / signininfo / signinlist 都能正常走到鉴权；
-            设备登记校验只挂在旧接口上，signinv2 不做这道门。
+            signinv2 只对新签活动开放，旧版账号硬打会返回 35100「获取amis配置失败」。
 
-        因此主链路 = 查状态 -> signinv2 -> 回读日历；旧 H5 signin 仅探测一次，
-        旧原生 taskcenter 接口需 BAIDUWP_TASKCENTER_LEGACY=1 才尝试。
+        因此：home 已签 -> 直接返回；version=2 -> signinv2；version=0/1 或
+        signinv2 失败 -> /coins/center/signin（8001 风控门）；旧原生 taskcenter
+        接口需 BAIDUWP_TASKCENTER_LEGACY=1 才尝试。
         """
+        self._warmup_session()
         state = self._center_sign_state()
         if state.get("invalid"):
             log("任务中心签到失败: 服务端返回 bduss 错误，cookie 缺少有效 STOKEN",
@@ -1266,37 +1375,47 @@ class BaiduPan:
 
         notes = []
         last_errno, last_error = None, ""
+        version = state.get("version")
+        version_name = {0: "旧版", 1: "灰度(CAN_BE_NEW)", 2: "新版"}.get(version, "未知")
+        log(f"  签到版本 signin_version={version}（{version_name}）", "INFO", self.log_tag)
 
-        # 1) 官方 H5 当前通道：/coins/center/signinv2
-        data = self._center_sign_call(self.device)
-        errno = data.get("errno")
-        error = str(data.get("error") or data.get("errmsg") or "")
-        log(f"  官方客户端通道 signinv2 -> errno={errno} error={error or '无'}",
-            "INFO", self.log_tag)
-        if errno == 0:
-            return self._finish_center_sign(data)
-        if errno == -6 or self._is_login_error(error):
-            return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
-        last_errno, last_error = errno, error
-        notes.append(f"官方通道 signinv2({CENTER_ERRNO.get(errno, error or errno)})")
+        # H5 的 handleAbtest(): isCanUseNewSign ? initNewSigninlist(signinv2)
+        #                                   : handleAutoSign(/coins/center/signin)
+        # 旧版/灰度账号根本不走 signinv2，硬打只会拿到 35100「获取amis配置失败」。
+        if version in (0, 1):
+            log("  signin_version 表明官方客户端走 /coins/center/signin，"
+                "跳过 signinv2（该接口只对新签活动开放）", "INFO", self.log_tag)
+            notes.append(f"signinv2(按版本 {version} 跳过)")
+        else:
+            # 1) 官方 H5 新签通道：/coins/center/signinv2
+            data = self._center_sign_call(self.device)
+            errno = data.get("errno")
+            error = str(data.get("error") or data.get("errmsg") or "")
+            log(f"  官方客户端通道 signinv2 -> errno={errno} error={error or '无'}",
+                "INFO", self.log_tag)
+            if errno == 0:
+                return self._finish_center_sign(data)
+            if errno == -6 or self._is_login_error(error):
+                return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+            last_errno, last_error = errno, error
+            notes.append(f"官方通道 signinv2({CENTER_ERRNO.get(errno, error or errno)})")
 
-        # 服务端可能上一轮已经签过（并发/上一条请求已落地）：失败后先回读状态再定性，
-        # 避免把「已签」误报成失败。
-        recheck = self._center_sign_state(self.device)
-        if recheck.get("signed") is True:
-            days = recheck.get("days")
-            suffix = f"，已连续签到 {days} 天" if days else ""
-            log("  signinv2 返回错误，但官方日历显示今日已签到 —— 按已签处理",
-                "WARN", self.log_tag)
-            return f"任务中心签到: 今日已签到{suffix}"
+            # 服务端可能上一轮已经签过（并发/上一条请求已落地）：失败后先回读状态再定性
+            recheck = self._center_sign_state(self.device)
+            if recheck.get("signed") is True:
+                days = recheck.get("days")
+                suffix = f"，已连续签到 {days} 天" if days else ""
+                log("  signinv2 返回错误，但官方日历显示今日已签到 —— 按已签处理",
+                    "WARN", self.log_tag)
+                return f"任务中心签到: 今日已签到{suffix}"
 
-        # 2) 账号/设备类风控 -> 换一台备用已登记设备再试一次
-        if errno in DEVICE_RISK_ERRNO or errno == 8001:
-            self.registry.set_cooldown(self.device, DEV_REPEAT_COOLDOWN, self.account_key)
-            alt_data, alt_device, alt_notes = self._center_sign_device_retry()
-            notes.extend(alt_notes)
-            if alt_data is not None and alt_data.get("errno") == 0:
-                return self._finish_center_sign(alt_data, alt_device)
+            # 2) 账号/设备类风控 -> 换一台备用已登记设备再试一次
+            if errno in DEVICE_RISK_ERRNO or errno == 8001:
+                self.registry.set_cooldown(self.device, DEV_REPEAT_COOLDOWN, self.account_key)
+                alt_data, alt_device, alt_notes = self._center_sign_device_retry()
+                notes.extend(alt_notes)
+                if alt_data is not None and alt_data.get("errno") == 0:
+                    return self._finish_center_sign(alt_data, alt_device)
 
         # 3) 旧 H5 通道（有鉴权前风控门，脚本侧通常只会拿到 8001）
         web_data = self._center_sign_call(self.device, "/coins/center/signin")
@@ -1323,6 +1442,8 @@ class BaiduPan:
                 return legacy
             notes.append(legacy or "旧原生 taskcenter 通道失败")
 
+        if version not in (0, 1):
+            self._dump_center_home("收尾诊断")
         detail = "；".join([n for n in notes if n]) or (last_error or f"errno={last_errno}")
         hint = CENTER_ERRNO.get(last_errno) or TASKCENTER_ERRNO.get(last_errno) or ""
         log(f"任务中心签到失败明细: {detail}", "ERR", self.log_tag)
