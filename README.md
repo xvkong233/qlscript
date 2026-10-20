@@ -10,7 +10,7 @@
 |---|---|---|---|
 | [baidu_netdisk.py](baidu_netdisk.py) | 百度网盘多合一签到 | `30 8 * * *` | `BAIDUWP_COOKIE` |
 | [wzyd.py](wzyd.py) | 王者营地签到 | `40 8 * * *` | `WZYD_TOKEN`、`WZYD_BODY`、`WZYD_WXQ_BODY` |
-| [rainyun.py](rainyun.py) | 雨云积分签到 | `50 8 * * *` | `RAINYUN_COOKIE` |
+| [rainyun.py](rainyun.py) | 雨云积分签到 | `50 8 * * *` | `RAINYUN_API_KEY` 或 `RAINYUN_COOKIE` |
 | [svyun.py](svyun.py) | 速维云签到 | `10 9 * * *` | `SVYUN_ACCOUNT` |
 
 ### 百度网盘多合一签到
@@ -64,9 +64,13 @@
 
 ### 雨云积分签到
 
-完成 [app.rainyun.com](https://app.rainyun.com/account/reward/earn)「积分中心 → 赚取积分 → 每日签到」，多账号。接口从雨云前端代码逆向确认（2026-10）：`POST api.v2.rainyun.com/user/reward/tasks`（`{"task_name":"每日签到"}`），签到结果以重查任务列表状态为准；CSRF 令牌与 `RYS` 防护头脚本自动处理，无需手动配置。
+完成 [app.rainyun.com](https://app.rainyun.com/account/reward/earn)「积分中心 → 赚取积分 → 每日签到 + 自动领积分任务」，多账号。接口从雨云前端代码逆向确认（2026-10）：`POST api.v2.rainyun.com/user/reward/tasks`（`{"task_name":"每日签到"}`），签到结果以重查任务列表状态为准；CSRF 令牌与 `RYS` 防护头脚本自动处理。
 
-**环境变量 `RAINYUN_COOKIE`**：`api.v2.rainyun.com` 的完整 Cookie。
+**通道A（推荐）`RAINYUN_API_KEY`**：雨云 API 密钥，形如 `ryapi_xxxxxxxx`。
+
+获取：登录 [app.rainyun.com](https://app.rainyun.com) → 用户中心 → [API 密钥](https://app.rainyun.com/account/settings/api-key) → 创建/复制。此通道用 `X-Api-Key` 头，**免 Cookie、免 CSRF、免人机验证**，是绕开 `10004` 的首选。多账号用 `&` 或换行分隔，也支持 `RAINYUN_API_KEY_1`、`_2` ……
+
+**通道B（兜底）`RAINYUN_COOKIE`**：`api.v2.rainyun.com` 的完整 Cookie。
 
 获取：浏览器登录 [app.rainyun.com](https://app.rainyun.com) → F12 → 网络(Network) → 随便点一个 `api.v2.rainyun.com` 请求 → 请求标头 → 复制整个 `Cookie` 的值整段粘贴（形如 `xxx=yyy; zzz=aaa`）。注意是 `api.v2.rainyun.com` 域下的请求，不是 `app.rainyun.com` 的 cookie。
 
@@ -74,7 +78,31 @@
 
 可选环境变量 `RAINYUN_DELAY`：每日随机延迟上限（分钟），默认 10，`0` 关闭。多账号之间随机间隔 3~15 秒。
 
-**返回码**：`code 200`=成功（实测）；`10012`=CSRF 失效（脚本自动刷新令牌重试）；`10004`=触发滑块验证码（去网页手动签一次后恢复自动）；`30002/30038`=Cookie 失效（重新复制更新，会话一般月级有效）。推送中还会提示其他可领取的积分任务（如绑定邮箱等一次性任务）。
+可选环境变量 `RAINYUN_TASK_PASSWORDS`：需要暗号的任务密码表，格式 `任务名=密码;任务名=密码` 或 JSON `{"关注雨云B站号":"abcd"}`。配置后脚本自动领取对应任务（如官方号私信结尾 4 个字）。
+
+可选环境变量 `RAINYUN_CLAIM_ALL`：设为 `1` 时对所有 `Status=1` 的任务都用（已配置密码或空密码）尝试领取，顺手清掉可领积分。
+
+可选环境变量 `RAINYUN_CAPTCHA_URL` / `RAINYUN_CAPTCHA_METHOD`（`GET`/`POST`）/ `RAINYUN_CAPTCHA_DATA`：外部打码服务，仅在通道B遇到 `10004` 时使用，脚本自动换腾讯 TCaptcha 票据（`vticket`/`vrandstr`）后重投。`RAINYUN_CAPTCHA_DATA` 支持 `{appid}`（= `2039519451`）与 `{url}` 两个占位符，响应里能递归找到 `ticket`/`randstr` 即可。
+
+可选环境变量 `RAINYUN_TCAPTCHA_SOLVER`（推荐）：指向真浏览器求解器 `solve_tcaptcha.cjs` 的路径。设置后遇到 `10004` 会自动拉起 node + Playwright + 真 Chrome，抓指令条/背景图 → 黑帽分割 + 尺度/旋转双不变 NCC 求点击坐标 → 派发真实鼠标点击 → 点击「确定」提交 → 取回 `ticket`/`randstr` 并带 `vticket`/`vrandstr` 重投。配套脚本在仓库 `tcaptcha-audit/`（`solve_tcaptcha.cjs` + `solve_click.py`）。还有 `RAINYUN_TCAPTCHA_TIMEOUT`（求解器超时秒数，默认 300）。
+
+**返回码**：`code 200`=成功（实测）；`10012`=CSRF 失效（脚本自动刷新令牌重试）；`10004`=风控要求人机验证（需 TCaptcha 的 `vticket`/`vrandstr`，**不是** `verifyCode` 字段；先试自动打码，不行则给出诊断指引）；`30011`=**账号级统一拦截**（见下方警示）；`10002`=输入参数无效；`30002/30038`=登录失效（重新复制更新，或改装 API 密钥）。
+
+> ⚠️ **关于 `10004` 的真相**：雨云把腾讯天御验证码（appid `2039519451`）挂在**领取接口**上，但它是**风控触发**而非硬性要求 —— 实测同一出口 IP 的浏览器会话打这个接口并不弹验证码。青龙机房 IP + 无浏览器指纹 + `dev-code` 设备码不匹配这三者叠加，才会把风险分顶到「必须人机验证」。因此「网页手动签一次就好」是错觉：手动签完当天任务变 `Status=2`，看起来恢复了，次日照样触发。别浪费时间在 sleep 和 UA 上。
+>
+> **补充（2026-10 实测）**：`10004` 只拦**会话（Cookie）通道**；`X-Api-Key` 通道完全豁免 —— 同样的裸 body 用 API Key 发送从不返回 `10004`。所以只要配上 `RAINYUN_API_KEY`，青龙上那个永远过不去的验证码就从根上消失了。
+
+> ⚠️ **关于 `30011` 的真相（最容易踩坑的一个）**：`30011 未达到完成这个任务的条件` **不是可靠的成功/失败判据**。实测两件事：
+> 1. 用 API Key 对**任意** `task_name` 发 POST（包括**不存在的任务名**、`Status=0` 的、`Status=2` 的、`Status=1` 的）都返回同一个 `30011`（只有空参数才报 `10002`），说明它是个泛化的「当前不可领 / 条件未满足」响应，服务端不会告诉你到底哪个条件没过；
+> 2. 但**真正领取成功时它也可能返回 `30011`** —— 实测 `关注雨云B站号`、`关注雨云淘宝店` 两个任务返回 `30011`，积分却各 `+1000`（5000 → 6500 → 8500）。
+>
+> **唯一可靠判据是复查任务列表的 `Status`（或积分变化）。** 脚本已按此实现：提交后一律重查 `Status==2`，`30011` 不再直接报失败。
+>
+> 而 `每日签到` 的 `30011` 则基本可确定是**风控要求 TCaptcha 票据**：浏览器里点「领取奖励」会先弹验证码，滑过去才真正入账（你可以在 DevTools 里看到两次 POST：第一次无 `vticket`，第二次带上）。
+
+> 🔍 **任务密码是前端硬编码的（CWE-602：客户端强行实施服务端安全机制）**：「关注B站/抖音/淘宝店、加入Q群/微信群」这类任务的密码白名单直接写在客户端 chunk 里 —— `verifyTasks:{"加入Q群":["我爱雨云"],"加入微信群":["雨云爱我"],"关注雨云淘宝店":["成功加入","关注成功"],"关注雨云B站号":["雨云爱你"],"关注雨云抖音号":["天气狐爱你"]}`，校验只是 `if(s && !s.includes(e)) 拒绝`，服务端未参与。脚本已把这些值作为内置默认（可用 `RAINYUN_TASK_PASSWORDS` 覆盖），作为服务端权威兜底的审计取证件。
+
+> ⚠️ **关于 `10004` 的真相**：雨云把腾讯天御验证码（appid `2039519451`）挂在**领取接口**上，但它是**风控触发**而非硬性要求 —— 实测同一出口 IP 的浏览器会话打这个接口并不弹验证码。青龙机房 IP + 无浏览器指纹 + `dev-code` 设备码不匹配这三者叠加，才会把风险分顶到「必须人机验证」。因此「网页手动签一次就好」是错觉：手动签完当天任务变 `Status=2`，看起来恢复了，次日照样触发。别浪费时间在 sleep 和 UA 上。
 
 ### 速维云签到
 
