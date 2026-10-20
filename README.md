@@ -31,7 +31,7 @@
 
 > STOKEN 说明：成长值/答题/PC 积分三个通道仅凭 BDUSS 即可运行；任务中心签到与补签需要 STOKEN。STOKEN 失效时推送会提示"任务中心签到失败: STOKEN 已失效，请更新配置中的完整 cookie"，其余功能不受影响，重新取一次 cookie 更新环境变量即可（频率约为月级）。
 
-**任务中心设备说明**：任务中心签到接口要求"已注册设备"且存在换号风控（`dev repeat`）。脚本为每个账号生成**固定设备标识**（由 cookie 哈希派生，不随运行变化）；当服务端对新设备收紧时自动回退到共享注册设备。推送中出现"设备校验中(dev repeat)，下次运行自动重试"属正常现象，多账号会按天轮换完成签到。
+**任务中心签到通道说明**：2026-10 复核确认——App 13.34.3 全量 42 个 dex 中已无 `/coins/taskcenter/signin` 字面量，当前客户端签到走 App 内 points-center H5：`/coins/center/signininfo` → `/coins/center/signinv2` → `/coins/center/signinlist`。脚本已按这条真实链路执行；旧接口只在 `BAIDUWP_TASKCENTER_LEGACY=1` 时兼容尝试。设备标识仍会冻结复用（`BAIDUWP_DEVICE_n` / `BAIDUWP_DEVICE_POOL` 可手工指定），用于 `9312/8001` 这类账号/设备风控的降级；历史上把 `errno=2` 解读成「设备未登记」的结论已被推翻。
 
 ### 王者营地签到（王者 + 万象棋双渠道）
 

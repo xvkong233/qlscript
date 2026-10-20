@@ -24,15 +24,21 @@ cron: 30 8 * * *
                    0~10 分钟再执行，使每天实际签到时间不同；设为 0 关闭。
                    手动调试时可设 0 立即执行。
 
-  --- 任务中心「设备登记」相关（详见文件末尾 §任务中心设备登记说明）---
+  --- 任务中心（积分中心）通道 ---
+  主链路已对齐 App 内 points-center H5（当前客户端唯一在用的签到链路）：
+      /coins/center/signininfo -> /coins/center/signinv2 -> /coins/center/signinlist
+  旧版 /coins/taskcenter/signin 当前客户端已不再调用，默认关闭。
+
   BAIDUWP_DEVICE          指定本机使用的任务中心设备标识（全局，覆盖自动派生）
   BAIDUWP_DEVICE_n        第 n 个账号专用的设备标识（优先于 BAIDUWP_DEVICE）
-  BAIDUWP_DEVICE_POOL     备用「已登记」设备池，多台用 & 或 , 分隔；
+  BAIDUWP_DEVICE_POOL     备用设备池，多台用 & 或 , 分隔；遇 9312/8001 时兜底，
                           运行期内每台最多服务一个账号，避免自造 dev repeat
   BAIDUWP_DEVICE_FILE     设备登记表落盘路径，默认脚本同目录
                           .baidu_taskcenter_device.json
   BAIDUWP_DEVICE_RESET    置 1 时清空登记的设备绑定（下次运行重新生成/指定）
   BAIDUWP_DEVICE_COOLDOWN 设备风控冷却秒数，默认 43200（12 小时）
+  BAIDUWP_TASKCENTER_LEGACY 置 1 时额外尝试旧版 /coins/taskcenter/signin
+                          （当前客户端已不调用该接口，仅老账号兼容用，默认关）
 
   --- 日志与等级预估 ---
   BAIDUWP_DEBUG           置 1 打开 DEBUG 级日志（打印每次 HTTP 请求/响应摘要）
@@ -163,12 +169,21 @@ PC_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "X-Requested-With": "XMLHttpRequest",
 }
+# points-center H5（App 任务中心/积分中心 WebView）的请求头：
+# 移动端 UA + 页面 Referer，与真实签到链路保持一致
+CENTER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
+    "Referer": "https://pan.baidu.com/operation/activitys/points/main",
+    "Accept": "application/json, text/plain, */*",
+    "X-Requested-With": "XMLHttpRequest",
+}
 TASK_BASE = {
     "clienttype": "1", "channel": "android_16_script_bd-netdisk_1027840c",
     "app": "android", "version": "13.34.3", "versioncode": "4228",
 }
 
-# 任务中心签到仅接受「已登记」设备，且一台设备不能同时服务多个账号。
+# 任务中心设备标识：一次生成、长期复用，且不要同一天喂给多个账号。
 #
 # 逆向 App 13.34.3 得到的设备标识供给链：
 #   bd_netdisk://com.baidu.netdisk.hybrid/getClientInfo
@@ -180,16 +195,20 @@ TASK_BASE = {
 #          只有首次启动才 DeviceId.getCUID() 生成一次并写回配置。
 # 即：设备标识是「安装维度一次性生成、永久复用」的稳定量，与 cookie/登录态无关。
 #
-# 服务端侧（实测）：
-#   /coins/taskcenter/signin 先做参数校验（缺 clienttype/cuid/devuid/task_id/
-#   task_from 任一即 errno=2 "param error"），通过后再查「账号↔设备」登记记录：
-#     未登记           -> "param error"
-#     已被别的账号占用 -> "dev repeat"
-#   /coins/taskcenter/checkdevmp 即 App 的 PointCenterApi.checkDeviceUnique()，
-#   errno==0 表示「本账号下该设备是新的（没有登记记录）」。
+# 2026-10 复核（修正上一版结论）：
+#   App 全量 42 个 dex 中只有 /coins/taskcenter/signinlist（MyPointApi.signStatus）
+#   与 /coins/taskcenter/checkdevmp（PointCenterApi.checkDeviceUnique），
+#   **不存在** /coins/taskcenter/signin —— 当前客户端的签到在 points-center H5：
+#       goToSign()       -> /coins/center/signininfo?action=1&ptype=5
+#       getNewSignList() -> /coins/center/signinv2?action=1&ptype=5
+#                        -> /coins/center/signinlist?action=1&ptype=5
+#   实测无 cookie：signinv2 / signininfo / signinlist -> invalid bduss（鉴权前无风控门）；
+#   /coins/center/signin -> 8001（鉴权前 HTJError 风控门）。
+#   因此旧接口的 errno=2/9230 与「设备未登记」无关，不要再靠 App 手动登记去撞它。
 #
-# 因此脚本必须保证：①同账号永远上报同一台设备；②同一天不把同一台设备喂给不同账号。
-# 本文件把 ① 的绑定关系与 ② 的冷却时间戳都持久化到磁盘。
+# 设备字段仍然保留并冻结：①H5 每个请求都会带 getClientInfo 的 cuid/devuid；
+# ②设备类风控码 9312/9302/9306 与 8001 仍按设备判定；③稳定设备能避免自造 dev repeat。
+# 本文件把账号↔设备绑定关系与风控冷却时间戳都持久化到磁盘。
 DEVICE_STATE_FILE = os.getenv("BAIDUWP_DEVICE_FILE", "").strip() or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".baidu_taskcenter_device.json")
 # 备用「已在服务端登记」的设备池：仅在账号自有设备被拒时兜底，
@@ -203,14 +222,41 @@ DEVICE_STATE_TTL = 180 * 86400
 # 官方客户端用它做设备-账号绑定签名: rchannel = MD5(AK + uid + time + channel)
 APP_CLIENT_AK = "1e34f40405355a992583c9d7b166cd39"
 
-# /coins/taskcenter/* 的实测错误码（只记录已实测到的语义，未验证的不臆测）。
+# 旧版 /coins/taskcenter/signin 的错误码（已确认该接口不在当前客户端代码里）。
+# App 13.34.3 全量 42 个 dex 中只有 "/coins/taskcenter/signinlist" 与
+# "/coins/taskcenter/checkdevmp"，不存在 "/coins/taskcenter/signin" 字面量。
+# 因此这里的 errno=2/9230 不能解读成「设备未登记」—— 它们只是旧接口的
+# 参数/任务契约已经失效（服务端不再为这个入口维护 task_id/task_from）。
 TASKCENTER_ERRNO = {
-    2: "服务端不认可该设备/参数（实测：该设备在本账号下无登记记录）",
-    9230: "实测当日签到日历为「未签」（不属于「今日已签」），且该设备状态同样是"
-          "「未登记」—— 与账号1/2 同为未登记设备却报不同错误，说明它与设备登记无关，"
-          "而是账号维度的差异（实测该账号已连续签到 5 天，多于账号1/2 的 4 天）",
-    9312: "该设备正在被其它账号使用或处于风控窗口",
+    2: "旧版 taskcenter 签到的参数/任务契约已失效（当前客户端已不调用该接口），"
+       "与设备是否登记无关",
+    9230: "旧版 taskcenter 签到接口的通用错误（同样与设备登记无关；当前客户端"
+          "已不再调用该接口）",
+    9312: "设备重复：同一台设备正在服务其它账号，或处于服务端校验窗口",
 }
+
+# points-center H5（App 任务中心/积分中心实际加载的页面）错误码。
+# 来源：points-center 前端风控映射表
+#   w={noBinding:9306, phoneRepeat:9302, deviceRepeat:9312,
+#      tokenCheckErr:35103, tokenNoAccord:35104, noLogin:-6}
+#   f={HTJError:8001, CHEAT_CODE_FREQUENTLY:8011, CHEAT_CODE_FREQUENTLY_OTHER:8024}
+CENTER_ERRNO = {
+    -6: "BDUSS 无效或未登录",
+    8001: "账号或设备异常（H5 鉴权前的风控门 HTJError）",
+    8011: "作弊请求过于频繁（CHEAT_CODE_FREQUENTLY）",
+    8024: "账号/设备被风控拦截（CHEAT_CODE_FREQUENTLY_OTHER）",
+    9302: "手机号重复：同一手机号下多账号",
+    9306: "账号未绑定手机号",
+    9312: "设备重复：同一设备多账号",
+    35103: "token 校验失败",
+    35104: "token 与账号不匹配",
+}
+CENTER_RISK_ERRNO = {8001, 8011, 8024}
+DEVICE_RISK_ERRNO = {9302, 9306, 9312, 35103, 35104}
+# 官方 H5 getNewSignList() 固定参数：action=1（日常签到）+ ptype=5（会员积分中心）
+CENTER_ACTION = "1"
+CENTER_PTYPE = "5"
+
 
 # 等级预估：优先手工指定，其次向服务端要「等级↔成长值」档位表
 LEVEL_TABLE_ENV = os.getenv("BAIDUWP_LEVEL_TABLE", "").strip()
@@ -741,8 +787,11 @@ class BaiduPan:
         params.update(extra_params)
         return self._http_get(path, params, headers)
 
-    def _pc_api(self, path: str, params: dict) -> dict:
-        return self._http_get(path, params, PC_HEADERS)
+    def _pc_api(self, path: str, params: dict, headers: dict = None) -> dict:
+        if headers is None:
+            # points-center H5 通道用移动端 UA + 页面 Referer；其余沿用 PC 客户端头
+            headers = CENTER_HEADERS if path.startswith("/coins/center/") else PC_HEADERS
+        return self._http_get(path, params, headers)
 
     @staticmethod
     def _not_logged_in(data: dict) -> bool:
@@ -854,9 +903,18 @@ class BaiduPan:
         result = self._pc_api("/coins/pc/signin", {})
         if result.get("errno") != 0:
             return f"积分签到失败: {result.get('error') or result.get('errno')}"
-        return f"积分签到成功，当前积分余额 {inner.get('points_balance')}"
+        # 签到前读到的余额是旧值，回读一次才能反映本次奖励（否则会少报 +6 之类的增量）
+        balance = inner.get("points_balance")
+        try:
+            fresh = self._pc_api("/coins/pc/signinlist",
+                                 {"clienttype": "8", "win64": "1", "vip": "2"})
+            if fresh.get("errno") == 0:
+                balance = (fresh.get("data") or {}).get("points_balance", balance)
+        except (RuntimeError, requests.RequestException):
+            pass
+        return f"积分签到成功，当前积分余额 {balance}"
 
-    # ---------- 4. 任务中心签到 ----------
+    # ---------- 4. 任务中心辅助：设备链 / 旧通道 ----------
     def _web_cuid(self) -> str:
         """从 cookie 里取网页端 CUID（MAWEBCUID=web_xxx）。
 
@@ -885,11 +943,10 @@ class BaiduPan:
         return self._api_get("/coins/taskcenter/signin", params)
 
     def _taskcenter_today_signed(self):
-        """读任务中心签到日历，判断今天是否已签。返回 True/False/None(取不到)。
+        """读旧版任务中心签到日历，判断今天是否已签。True/False/None(取不到)。
 
-        实测 errno 9230 "signin error" 只出现在已连续签到天数更多的账号上，
-        高度疑似「今日任务中心已签到」。先查日历既能解释该错误码，也能省掉
-        后面整串无意义的设备尝试。
+        仅用于 BAIDUWP_TASKCENTER_LEGACY 兼容链路。当前客户端签到状态请走
+        _center_sign_state()（H5 signininfo / center signinlist）。
         """
         try:
             cal = self._pc_api("/coins/taskcenter/signinlist", dict(self.task_base))
@@ -930,7 +987,8 @@ class BaiduPan:
         return params
 
     def _taskcenter_signin_once(self, device: str, extra: dict = None) -> dict:
-        params = {"cuid": device, "devuid": device, **TASK_BASE}
+        """旧版原生 /coins/taskcenter/signin（当前客户端已不调用，仅兼容链路）。"""
+        params = {"cuid": device, "devuid": device, "ptype": CENTER_PTYPE, **TASK_BASE}
         if extra:
             params.update(extra)
         params.update({
@@ -1006,18 +1064,286 @@ class BaiduPan:
             time.sleep(wait)
         return data, error
 
-    def taskcenter_signin(self) -> str:
-        """任务中心签到：按「账号自有设备 -> 环境变量指定 -> 备用已登记池」依次尝试。
+    # ---------- 4. 任务中心签到（官方 H5 通道） ----------
+    def _center_api(self, path: str, params: dict, device: str = "") -> dict:
+        """points-center H5 通道：按官方 getClientInfo 带上设备字段。
 
-        对照 App 行为修正的三点：
-          * 设备标识必须长期稳定（App 是一次生成永久复用），否则永远是"新设备"；
-          * dev repeat 只是该设备进入服务端校验窗口，应换下一台继续，而不是直接放弃；
-          * param error 说明该设备没有登记记录，用 checkdevmp 复核并给出可执行指引；
-          * 任何设备失败后写入冷却时间戳，下次运行不再无脑重撞同一台。
+        H5 页面在 App WebView 里会给每个请求补 clienttype=1 + cuid/devuid
+        （module 23477: d = await bridge.invoke("getClientInfo")）。
         """
-        # 先读服务端签到日历：今天已签就没必要再折腾设备（实测 errno 9230 即此情形）
+        p = {"clienttype": "1", "cuid": device or self.device,
+             "devuid": device or self.device}
+        p.update(params or {})
+        return self._pc_api(path, p)
+
+    @staticmethod
+    def _parse_sign_calendar(payload: dict) -> dict:
+        """解析「今天签没签 / 连续天数」，兼容三种官方响应形状。
+
+          A) H5 signininfo:   data.signin_state.SignedToday
+          B) 原生 App:        data.today_signined / data.con_signin_cnt
+          C) taskcenter 日历: data.start_time + data.date + signin_list[].day/signed
+        """
+        inner = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(inner, dict):
+            return {"signed": None, "days": None}
+        state = inner.get("signin_state")
+        state = state if isinstance(state, dict) else {}
+        signed = None
+        for key in ("SignedToday", "signed_today", "today_signined",
+                    "todaySignined", "is_signin"):
+            if key in state:
+                signed = bool(state.get(key))
+                break
+            if key in inner:
+                signed = bool(inner.get(key))
+                break
+        days = None
+        for key in ("signin_days", "con_signin_cnt", "signin_cnt",
+                    "signinCount", "continuous_days"):
+            val = inner.get(key)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, int) or (isinstance(val, str) and val.isdigit()):
+                days = int(val)
+                break
+        start, now = inner.get("start_time"), inner.get("date")
+        items = inner.get("signin_list") or inner.get("list") or []
+        if isinstance(items, list) and start and now:
+            try:
+                today = (int(now) - int(start)) // 86400 + 1
+            except (TypeError, ValueError):
+                today = None
+            if today:
+                if signed is None:
+                    for item in items:
+                        if isinstance(item, dict) and item.get("day") == today:
+                            signed = bool(item.get("signed") or item.get("is_signin"))
+                            break
+                if days is None:
+                    days = sum(1 for it in items if isinstance(it, dict)
+                               and (it.get("signed") or it.get("is_signin")))
+        return {"signed": signed, "days": days}
+
+    def _center_sign_state(self, device: str = "") -> dict:
+        """读签到状态，顺序对齐客户端（signininfo -> signinlist -> 原生日历）。
+
+        返回 {"signed": True/False/None, "days": int|None, "source": str,
+              "invalid": bool}；invalid 表示 cookie 失效（取不到结论）。
+        """
+        probes = (
+            ("H5 signininfo", "/coins/center/signininfo"),
+            ("H5 signinlist", "/coins/center/signinlist"),
+            ("App signinlist", "/coins/taskcenter/signinlist"),
+        )
+        invalid = False
+        for name, path in probes:
+            try:
+                data = self._center_api(path, {"action": CENTER_ACTION,
+                                               "ptype": CENTER_PTYPE}, device)
+            except (RuntimeError, requests.RequestException) as e:
+                log(f"  签到状态({name}) 读取失败: {e.__class__.__name__}: {e}",
+                    "WARN", self.log_tag)
+                continue
+            errno = data.get("errno")
+            error = str(data.get("error") or data.get("errmsg") or "")
+            if errno != 0:
+                if errno == -6 or self._is_login_error(error):
+                    invalid = True
+                log(f"  签到状态({name}) -> errno={errno} error={error or '无'}",
+                    "DEBUG", self.log_tag)
+                continue
+            info = self._parse_sign_calendar(data)
+            info["source"] = name
+            # 能拿到 200+errno=0 就说明会话有效，不因前一个探针的 -6 误判为失效
+            info["invalid"] = False
+            log(f"  签到状态({name}) -> today_signed={info['signed']} "
+                f"连续天数={info['days']}", "INFO", self.log_tag)
+            if info["signed"] is not None or info["days"] is not None:
+                return info
+        return {"signed": None, "days": None, "source": "未取到", "invalid": invalid}
+
+    @staticmethod
+    def _is_login_error(text) -> bool:
+        raw = str(text or "")
+        low = raw.lower()
+        return "bduss" in low or "login" in low or "登录" in raw
+
+    def _center_sign_once(self, device: str, path: str = "/coins/center/signinv2") -> dict:
+        """按官方 H5 getNewSignList() 的参数签一次（action=1 / ptype=5）。"""
+        params = {
+            "action": CENTER_ACTION, "ptype": CENTER_PTYPE,
+            "app": TASK_BASE["app"], "version": TASK_BASE["version"],
+            "versioncode": TASK_BASE["versioncode"],
+        }
+        return self._center_api(path, params, device)
+
+    def _center_sign_call(self, device: str, path: str = "/coins/center/signinv2") -> dict:
+        try:
+            return self._center_sign_once(device, path)
+        except (RuntimeError, requests.RequestException) as e:
+            return {"errno": -1, "error": f"{e.__class__.__name__}: {e}"}
+
+    def _finish_center_sign(self, data: dict, device: str = "") -> str:
+        """签到成功后回读日历补连续天数（客户端 getNewSignList 的第二步）。
+
+        device：真正签到成功的设备（账号自有或备用池）；只清除这台设备的冷却，
+        避免把刚刚因风控被隔离的账号自有设备“洗白”而下次白撞。
+        """
+        device = device or self.device
+        days = None
+        try:
+            days = self._center_sign_state(device).get("days")
+        except (RuntimeError, requests.RequestException):
+            pass
+        inner = data.get("data") if isinstance(data, dict) else None
+        if days is None and isinstance(inner, dict):
+            for key in ("signin_days", "con_signin_cnt", "signin_cnt"):
+                if isinstance(inner.get(key), int):
+                    days = inner[key]
+                    break
+        self.registry.set_cooldown(device, 0, self.account_key)
+        suffix = f"，已连续签到 {days} 天" if days else ""
+        return f"任务中心签到: 完成{suffix}"
+
+    def _center_sign_device_retry(self) -> tuple:
+        """设备类风控时换一台备用已登记设备再试一次 signinv2。
+
+        返回 (data, device, notes)；成功时保持该设备在本轮运行中的独占
+        （acquire_shared 不释放），避免同一轮的其它账号又撞上去。
+        """
+        notes = []
+        for label, device in self._device_candidates()[1:]:
+            if self.registry.in_cooldown(device):
+                left = self.registry.cooldown_left(device)
+                notes.append(f"{label}(风控冷却中，约{max(1, left // 3600)}h后解除)")
+                continue
+            if not self.registry.acquire_shared(device, self.account_key):
+                notes.append(f"{label}(本次运行已被其它账号占用)")
+                continue
+            log(f"  换用{label}: {device}", "INFO", self.log_tag)
+            data = self._center_sign_call(device)
+            errno = data.get("errno")
+            error = str(data.get("error") or data.get("errmsg") or "")
+            log(f"  {label} signinv2 -> errno={errno} error={error or '无'}",
+                "INFO", self.log_tag)
+            if errno == 0:
+                return data, device, notes
+            self.registry.release_shared(device)
+            notes.append(f"{label}({CENTER_ERRNO.get(errno, error or errno)})")
+            if errno in DEVICE_RISK_ERRNO:
+                continue
+            break
+        return None, "", notes
+
+    def taskcenter_signin(self) -> str:
+        """任务中心（积分中心）签到：完整复刻官方 H5 客户端链路。
+
+        逆向依据（App 13.34.3 + points-center H5）：
+          * 全量 42 个 dex 里只有 "/coins/taskcenter/signinlist" 和
+            "/coins/taskcenter/checkdevmp"，**不存在** "/coins/taskcenter/signin"
+            —— 当前客户端根本不调这个旧接口，它的 errno=2 不是「设备未登记」。
+          * 真正的签到在 points-center H5：
+              goToSign()       -> GET /coins/center/signininfo?action=1&ptype=5
+              getNewSignList() -> GET /coins/center/signinv2?action=1&ptype=5
+                              -> GET /coins/center/signinlist?action=1&ptype=5
+          * 实测 /coins/center/signin 有「鉴权前」风控门（无 cookie 也回 8001），
+            而 signinv2 / signininfo / signinlist 都能正常走到鉴权；
+            设备登记校验只挂在旧接口上，signinv2 不做这道门。
+
+        因此主链路 = 查状态 -> signinv2 -> 回读日历；旧 H5 signin 仅探测一次，
+        旧原生 taskcenter 接口需 BAIDUWP_TASKCENTER_LEGACY=1 才尝试。
+        """
+        state = self._center_sign_state()
+        if state.get("invalid"):
+            log("任务中心签到失败: 服务端返回 bduss 错误，cookie 缺少有效 STOKEN",
+                "ERR", self.log_tag)
+            return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+        if state.get("signed") is True:
+            days = state.get("days")
+            suffix = f"，已连续签到 {days} 天" if days else ""
+            return f"任务中心签到: 今日已签到{suffix}"
+
+        notes = []
+        last_errno, last_error = None, ""
+
+        # 1) 官方 H5 当前通道：/coins/center/signinv2
+        data = self._center_sign_call(self.device)
+        errno = data.get("errno")
+        error = str(data.get("error") or data.get("errmsg") or "")
+        log(f"  官方客户端通道 signinv2 -> errno={errno} error={error or '无'}",
+            "INFO", self.log_tag)
+        if errno == 0:
+            return self._finish_center_sign(data)
+        if errno == -6 or self._is_login_error(error):
+            return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+        last_errno, last_error = errno, error
+        notes.append(f"官方通道 signinv2({CENTER_ERRNO.get(errno, error or errno)})")
+
+        # 服务端可能上一轮已经签过（并发/上一条请求已落地）：失败后先回读状态再定性，
+        # 避免把「已签」误报成失败。
+        recheck = self._center_sign_state(self.device)
+        if recheck.get("signed") is True:
+            days = recheck.get("days")
+            suffix = f"，已连续签到 {days} 天" if days else ""
+            log("  signinv2 返回错误，但官方日历显示今日已签到 —— 按已签处理",
+                "WARN", self.log_tag)
+            return f"任务中心签到: 今日已签到{suffix}"
+
+        # 2) 账号/设备类风控 -> 换一台备用已登记设备再试一次
+        if errno in DEVICE_RISK_ERRNO or errno == 8001:
+            self.registry.set_cooldown(self.device, DEV_REPEAT_COOLDOWN, self.account_key)
+            alt_data, alt_device, alt_notes = self._center_sign_device_retry()
+            notes.extend(alt_notes)
+            if alt_data is not None and alt_data.get("errno") == 0:
+                return self._finish_center_sign(alt_data, alt_device)
+
+        # 3) 旧 H5 通道（有鉴权前风控门，脚本侧通常只会拿到 8001）
+        web_data = self._center_sign_call(self.device, "/coins/center/signin")
+        web_errno = web_data.get("errno")
+        web_error = str(web_data.get("error") or web_data.get("errmsg") or "")
+        log(f"  旧 H5 通道 signin -> errno={web_errno} error={web_error or '无'}",
+            "INFO", self.log_tag)
+        if web_errno == 0:
+            return self._finish_center_sign(web_data)
+        if web_errno == -6 or self._is_login_error(web_error):
+            return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+        if web_errno in CENTER_RISK_ERRNO:
+            notes.append(f"旧 H5 通道({CENTER_ERRNO.get(web_errno, web_error or web_errno)})")
+            log("  旧 H5 通道的风控门在鉴权之前（账号/设备维度），脚本没有 "
+                "sofire 指纹 z，无法通过；当前客户端签到走 signinv2，本来就不需要它",
+                "WARN", self.log_tag)
+        else:
+            last_errno, last_error = web_errno, web_error
+
+        # 4) 旧原生 taskcenter 通道（默认关闭；当前客户端已不再调用）
+        if os.getenv("BAIDUWP_TASKCENTER_LEGACY", "").strip() in ("1", "true", "True"):
+            legacy = self._taskcenter_signin_legacy()
+            if legacy and "失败" not in legacy:
+                return legacy
+            notes.append(legacy or "旧原生 taskcenter 通道失败")
+
+        detail = "；".join([n for n in notes if n]) or (last_error or f"errno={last_errno}")
+        hint = CENTER_ERRNO.get(last_errno) or TASKCENTER_ERRNO.get(last_errno) or ""
+        log(f"任务中心签到失败明细: {detail}", "ERR", self.log_tag)
+        if hint:
+            log(f"  错误码解读(errno={last_errno}): {hint}", "ERR", self.log_tag)
+        log("  注意：当前客户端已不调用 /coins/taskcenter/signin（APK 内无该字面量），"
+            "旧接口的 errno=2 与「设备未登记」无关；不要再按「去 App 里手动登记设备」"
+            "处理", "ERR", self.log_tag)
+        return f"任务中心签到: 失败（{detail}）"
+
+    def _taskcenter_signin_legacy(self) -> str:
+        """旧版原生通道兜底（当前客户端已不调用，仅 BAIDUWP_TASKCENTER_LEGACY=1 启用）。
+
+        保留原设备降级逻辑：
+          * 设备标识必须长期稳定（App 是一次生成永久复用）；
+          * dev repeat 只说明该设备进入服务端校验窗口，应换下一台继续；
+          * 每台设备失败即写冷却时间戳，下次运行不再无脑重撞。
+        """
+        # 先读旧接口的签到日历；今天已签就不再折腾设备
         signed = self._taskcenter_today_signed()
-        log(f"任务中心签到日历: today_signed={signed}", "INFO", self.log_tag)
+        log(f"  旧原生通道签到日历: today_signed={signed}", "INFO", self.log_tag)
         if signed is True:
             return "任务中心签到: 今日已签到"
 
@@ -1089,7 +1415,7 @@ class BaiduPan:
             last_errno = data.get("errno")
             is_new = self._probe_device_register(label, device)
             if is_new is False:
-                # 设备已在册 —— 卡点不是登记，再走登记流程毫无意义，
+                # checkdevmp 说这台设备「不是新的」—— 再走设备参数重试毫无意义，
                 # 直接把真实错误码、解读和任务中心首页状态打出来。
                 hint = TASKCENTER_ERRNO.get(data.get("errno"), "")
                 log(f"  设备已在册但签到仍失败: errno={data.get('errno')} "
@@ -1101,12 +1427,11 @@ class BaiduPan:
                 # 共享设备在本账号下失败时释放占用，让同轮其它账号还能试
                 if shared:
                     self.registry.release_shared(device)
-                notes.append(f"{label}(已登记但服务端仍拒绝 errno={data.get('errno')})")
+                notes.append(f"{label}(checkdevmp 非新但旧接口仍拒绝 errno={data.get('errno')})")
                 continue
-            # 设备未登记（或状态未知）：按官方客户端流程补上设备绑定参数再试。
-            # cuid/devuid 只是标识；App 的每个请求还会带 rchannel/rand/time，
-            # 其中 rchannel = MD5(AK + uid + time + channel) 才是把设备与账号
-            # 绑定的签名。缺它时服务端可能无从登记该设备 -> param error。
+            # 旧接口返回非 dev-repeat（或取不到 checkdevmp 结论）：保留上一版的
+            # 「补 rchannel/rand/time 再试一次」实验，仅作兼容观察。
+            # 注意：旧接口 errno=2 已确认是接口契约失效，不是设备未登记。
             try:
                 app_data = self._taskcenter_signin_once(
                     device, self._app_client_params(device))
@@ -1136,9 +1461,8 @@ class BaiduPan:
                 continue
             need_register = True
             last_errno = data.get("errno")
-            notes.append(f"{label}(未登记)")
-            # 未登记 ≠ 一定就是登记问题：账号3 的设备同样未登记却报 9230。
-            # 因此这里也要取一份任务中心首页，否则这类错误永远缺证据。
+            notes.append(f"{label}(旧接口未放行)")
+            # 与 checkdevmp 结论无关：旧接口下同类失败也要留一份任务中心首页证据。
             if not dumped:
                 self._dump_taskcenter_state(label)
                 dumped = True
@@ -1149,28 +1473,21 @@ class BaiduPan:
             self._dump_taskcenter_state("收尾诊断")
         detail = "；".join(notes) if notes else "无可用设备"
         if need_register:
-            log(f"任务中心签到失败明细: {detail}", "ERR", self.log_tag)
+            log(f"任务中心签到(旧原生通道)失败明细: {detail}", "ERR", self.log_tag)
             hint = TASKCENTER_ERRNO.get(last_errno, "")
             if hint:
                 log(f"  服务端错误码解读(errno={last_errno}): {hint}", "ERR", self.log_tag)
-            # 实测确认：App 登记的是「它自己的 devuid」，脚本派生的这台不会被登记；
-            # 只做第 1 步没用，必须把 App 的 devuid 取出来给脚本用。
-            log("处理办法（两步都要做，只做第 1 步没用）:", "ERR", self.log_tag)
-            log("  1) 用官方 App 登录该账号，打开一次「任务中心/积分中心」—— "
-                "这一步把 App 自己的 devuid 登记到服务端", "ERR", self.log_tag)
-            log("  2) 取出该 App 的 devuid，填进 BAIDUWP_DEVICE_n（n=账号序号）。"
-                "脚本派生的是另一台设备，App 不会替它登记", "ERR", self.log_tag)
-            log("     取 devuid 最省事：手机抓包看 App 打开任务中心时请求 URL 里的 "
-                "devuid= 参数（cuid= 通常同值）", "ERR", self.log_tag)
-            log("     备选：App 配置存于 MMKV 的 deviceId 键，但该文件 RC4 加密，"
-                "不推荐手抠", "ERR", self.log_tag)
+            log("  该接口是旧版原生 taskcenter 通道：App 13.34.3 全量 dex 中已无 "
+                "\"/coins/taskcenter/signin\" 字面量，当前客户端签到走 H5 "
+                "signinv2；旧接口的 errno=2 不代表设备未登记", "ERR", self.log_tag)
+            log("  如主链路仍不稳定，可保留 BAIDUWP_TASKCENTER_LEGACY=1 观察，"
+                "或将其关闭以减少无关请求", "ERR", self.log_tag)
             if last_errno not in (2, None):
-                # 设备未登记但服务端给的是别的错误码（如 9230）：不能只报「未登记」
-                return (f"任务中心签到: 失败（设备未登记，服务端另返回 "
+                return (f"任务中心签到(旧原生通道): 失败（服务端返回 "
                         f"errno={last_errno}）")
-            return "任务中心签到: 失败（设备未在服务端登记）"
-        log(f"任务中心签到失败明细: {detail}", "WARN", self.log_tag)
-        return f"任务中心签到: 失败（{detail}）"
+            return "任务中心签到(旧原生通道): 失败（旧接口契约已失效）"
+        log(f"旧原生通道失败明细: {detail}", "WARN", self.log_tag)
+        return f"任务中心签到(旧原生通道): 失败（{detail}）"
 
     # ---------- 5. 自动补签 ----------
     def makeup_signin(self) -> str:
