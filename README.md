@@ -39,15 +39,15 @@
 `"android_" + Build.VERSION.RELEASE + "_" + Build.MODEL + "_bd-netdisk_1027840c"`
 （`newhome/fr10.java` 里的 mars 公共参数 `Platform`，网盘本体后缀 `1027840c`），
 WebView UA 里又带一遍 `Android <RELEASE>; <MODEL> Build/<Build.ID>`。所以脚本改成**机型画像驱动**：
-`BAIDUWP_PROFILE` 默认 `xiaomi15`，channel、WebView UA、网页 UA、REST UA 全部从同一份 Build 推导，
+`BAIDUWP_PROFILE` 默认 `xiaomi17promax`，channel、WebView UA、网页 UA、REST UA 全部从同一份 Build 推导，
 开局会自查并在不自洽时告警（"channel 写小米、UA 写 vivo"比用错机型更像伪造）。
 内置画像（型号码取自 [khwang9883/MobileModels](https://khwang9883.github.io/MobileModels/brands/xiaomi.html)）：
 
 | `BAIDUWP_PROFILE` | 机型 | `Build.MODEL` | 系统 |
 |---|---|---|---|
-| `xiaomi15`（默认） | Xiaomi 15 | `24129PN74C` | HyperOS 2.0 / Android 15 |
+| `xiaomi17promax`（默认） | Xiaomi 17 Pro Max | `2509FPN0BC` | HyperOS 3 / Android 16 |
 | `xiaomi14ultra` | Xiaomi 14 Ultra | `24031PN0DC` | HyperOS 1.0 / Android 14 |
-| `xiaomi17promax` | Xiaomi 17 Pro Max | `2509FPN0BC` | HyperOS 3 / Android 16 |
+| `xiaomi15` | Xiaomi 15 | `24129PN74C` | HyperOS 2.0 / Android 15 |
 | `xiaomi14` | Xiaomi 14 | `23127PN0CC` | HyperOS 1.0 / Android 14 |
 | `vivo-v2364a` | vivo V2364A（原抓包机） | `V2364A` | Android 15 |
 

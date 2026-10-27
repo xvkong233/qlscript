@@ -39,10 +39,10 @@ cron: 30 8 * * *
   BAIDUWP_TASKCENTER_WEB 网页端通道（clienttype=5 + MAWEBCUID，不需要 z）开关，默认 1；
                           仅在 cookie 带 MAWEBCUID 时才会被尝试
 
-  BAIDUWP_PROFILE         机型画像（默认 xiaomi15）：控制 channel 与 WebView UA 里的机型/系统版本。
-                          xiaomi15       = Xiaomi 15 / 24129PN74C / HyperOS 2.0 (Android 15)   ← 默认
+  BAIDUWP_PROFILE         机型画像（默认 xiaomi17promax）：控制 channel 与 WebView UA 的机型/系统版本。
+                          xiaomi17promax = Xiaomi 17 Pro Max / 2509FPN0BC / HyperOS 3 (Android 16)  ← 默认
+                          xiaomi15       = Xiaomi 15 / 24129PN74C / HyperOS 2.0 (Android 15)
                           xiaomi14ultra  = Xiaomi 14 Ultra / 24031PN0DC / HyperOS 1.0 (Android 14)
-                          xiaomi17promax = Xiaomi 17 Pro Max / 2509FPN0BC / HyperOS 3 (Android 16)
                           xiaomi14       = Xiaomi 14 / 23127PN0CC / HyperOS 1.0 (Android 14)
                           vivo-v2364a    = 原抓包机（内置 z 的来源，需完全复刻时用）
                           型号码取自 khwang9883/MobileModels（小米机型汇总）。
@@ -255,7 +255,7 @@ DEVICE_PROFILES = {
         "build_id": "V417IR", "chrome": "110.0.5481.154",
     },
 }
-DEFAULT_PROFILE = "xiaomi15"
+DEFAULT_PROFILE = "xiaomi17promax"
 
 
 def _profile_key(name: str) -> str:
