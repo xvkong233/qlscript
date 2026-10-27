@@ -735,7 +735,7 @@ class DeviceRegistry:
     def __init__(self, path: str):
         self.path = path
         self.data = {"version": 1, "accounts": {}, "devices": {},
-                     "growth": {}, "zc": {}}
+                     "growth": {}, "zc": {}, "web": {}}
         self._run_shared_users = {}      # device -> account_key（仅本次进程运行期）
         try:
             with open(self.path, encoding="utf-8") as f:
@@ -745,6 +745,7 @@ class DeviceRegistry:
                 self.data["devices"] = raw.get("devices") or {}
                 self.data["growth"] = raw.get("growth") or {}
                 self.data["zc"] = raw.get("zc") or {}
+                self.data["web"] = raw.get("web") or {}
                 self._gc()
         except FileNotFoundError:
             pass
@@ -897,6 +898,31 @@ class DeviceRegistry:
             "at": time.time(),
         }
         self.save()
+
+    def set_web_verdict(self, account_key: str, cuid: str, status: str):
+        """记住「网页端通道」的实测结论，避免每天拿同一套参数白撞。
+
+        只记 errno=2 这种「该入口同样要 z」的结论；绑定 cuid 指纹，
+        cookie 换代/换设备标识后自动失效。14 天后重试（法规/风控都会变）。
+        """
+        if not account_key or not cuid:
+            return
+        self.data.setdefault("web", {})[account_key] = {
+            "cuid_fp": hashlib.md5(str(cuid).encode("utf-8")).hexdigest()[:8],
+            "status": status,
+            "at": time.time(),
+        }
+        self.save()
+
+    def web_verdict(self, account_key: str, cuid: str) -> dict:
+        item = (self.data.get("web") or {}).get(account_key) or {}
+        if not item or not cuid:
+            return {}
+        if item.get("cuid_fp") != hashlib.md5(str(cuid).encode("utf-8")).hexdigest()[:8]:
+            return {}
+        if time.time() - float(item.get("at") or 0) > 14 * 86400:
+            return {}
+        return item
 
     def z_owner(self) -> dict:
         """返回 z 的归属记录；超过 14 天就当没学过（避免旧结论永久生效）。"""
@@ -1337,31 +1363,37 @@ class BaiduPan:
         return f"积分签到成功，当前积分余额 {balance}"
 
     # ---------- 4. 任务中心辅助：设备链 / 旧通道 ----------
-    def _web_cuid(self) -> str:
-        """取网页端 CUID（MAWEBCUID=web_xxx）。
+    def _web_cuid_info(self) -> tuple:
+        """取网页端设备标识：返回 (来源, 值)。两者都是**服务端下发的**。
 
-        它由服务端下发给浏览器，属于服务端已知的设备标识；
-        与脚本派生并伪装的安卓设备不是一回事。
+          MAWEBCUID  网页端 CUID（web_xxx），最贴近网页会话；
+          BAIDUID    浏览器身份，预热 pan.baidu.com 时由 Set-Cookie 下发
+                     （形如 `XXXX:FG=1`，取 `:` 前的部分）。
 
-        优先读用户粘贴的 cookie 串；读不到再看会话 Jar —— 青龙里通常只填
-        `BDUSS`/`STOKEN`，而 MAWEBCUID 是 _warmup_session() 访问网页时
-        服务端 Set-Cookie 下发的，只看原串会漏掉它（网页端通道就永远不触发）。
-        取不到返回空串。
+        青龙里通常只填 `BDUSS`/`STOKEN`，所以只认粘贴串会永远拿不到 ——
+        先看粘贴串，再看会话 Jar（_warmup_session 之后就有 BAIDUID 了）。
+        两个都没有返回 ("", "")。
         """
         m = re.search(r"MAWEBCUID=([^;,\s]+)", self.cookie)
         if m:
-            return m.group(1)
+            return "MAWEBCUID", m.group(1)
         jar = getattr(self, "session", None)
         if jar is not None:
             try:
-                for cookie in jar.cookies:
-                    if cookie.name == "MAWEBCUID" and cookie.value:
-                        return cookie.value
+                values = {c.name: c.value for c in jar.cookies if c.value}
             except Exception:            # noqa: BLE001 取不到就当没有
-                pass
-        return ""
+                values = {}
+            if values.get("MAWEBCUID"):
+                return "MAWEBCUID", values["MAWEBCUID"]
+            if values.get("BAIDUID"):
+                # BAIDUID 的完整形态是 `<hash>:FG=1`，设备标识只取冒号前那段
+                return "BAIDUID", str(values["BAIDUID"]).split(":")[0]
+        return "", ""
 
-    def _taskcenter_signin_web(self) -> dict:
+    def _web_cuid(self) -> str:
+        return self._web_cuid_info()[1]
+
+    def _taskcenter_signin_web(self, web_cuid: str = "") -> dict:
         """走网页端通道签一次：clienttype=5(wap) + 网页 CUID，不带安卓伪装。
 
         动机：脚本的会话本来就是网页端拿的（PANWEB=1 / BDCLND / MAWEBCUID），
@@ -1373,7 +1405,7 @@ class BaiduPan:
         参数只用网页端会带的 task_id/task_from/is_growth，成本一次请求。
         走 _pc_api（与其它任务中心请求同一出口），便于离线测试统一桩。
         """
-        web_cuid = self._web_cuid()
+        web_cuid = web_cuid or self._web_cuid()
         params = {
             "clienttype": "5",                  # wap/H5，与会话来源一致
             "cuid": web_cuid, "devuid": web_cuid,
@@ -1563,9 +1595,11 @@ class BaiduPan:
 
         if errno == 0:
             self.registry.note_registration(self.device, "reported")
-            log(f"  设备登记: 完成。新设备 {self.device} 已带到服务端（首次登录建档）；"
+            # 注意：checkdevmp 只回报 errno，不区分「新设备」还是「已在册」，
+            # 所以这里只说“已上报”，不说“已建档/新设备”（避免过度断言）。
+            log(f"  设备登记: 完成。设备 {self.device} 已上报（checkdevmp errno=0）；"
                 f"之后一直用它，不再每天换", "INFO", self.log_tag)
-            return f"设备登记: 首次登录已上报新设备（…{self.device[-8:]}）"
+            return f"设备登记: 首次登录已上报设备（…{self.device[-8:]}）"
         if errno == -6 or self._is_login_error(msg):
             self.registry.note_registration(self.device, "login_error", msg)
             log("  设备登记: cookie 失效，无法上报（需含 STOKEN 的完整 cookie）",
@@ -1932,27 +1966,37 @@ class BaiduPan:
             notes.append(f"任务系统通道(z 属账号 {owner_uid}，未配 BAIDUWP_Z_{self.index})")
         else:
             # 1) 网页端通道：会话本身就是网页端，且不需要 sofire z
-            if TASKCENTER_WEB and self._web_cuid():
+            cuid_kind, web_cuid = self._web_cuid_info()
+            seen = self.registry.web_verdict(self.account_key, web_cuid)
+            if TASKCENTER_WEB and web_cuid and seen.get("status") != "param_error":
+                log(f"  网页端通道: 设备标识用服务端下发的 {cuid_kind}"
+                    f"（{_mask_credential(web_cuid, 6)}）", "DEBUG", self.log_tag)
                 try:
-                    web = self._taskcenter_signin_web()
+                    web = self._taskcenter_signin_web(web_cuid)
                 except (RuntimeError, requests.RequestException) as e:
                     web = {"errno": -1, "error": f"{e.__class__.__name__}: {e}"}
                 w_errno = web.get("errno")
                 w_msg = str(web.get("error") or web.get("errmsg") or "")
-                log(f"  网页端通道(clienttype=5 + MAWEBCUID，无 z) -> errno={w_errno} "
+                log(f"  网页端通道(clienttype=5 + {cuid_kind}，无 z) -> errno={w_errno} "
                     f"error={w_msg or '无'}", "INFO", self.log_tag)
                 if w_errno == 0:
                     return self._tc_success(web)
                 if w_errno == -6 or self._is_login_error(w_msg):
                     return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
-                if w_errno != 2:
+                if w_errno == 2:
+                    # 该入口也走 z 校验：记下来，14 天内不再用同一套参数白撞
+                    self.registry.set_web_verdict(self.account_key, web_cuid, "param_error")
+                    notes.append("网页端通道(参数校验未通过，说明该入口也要 z)")
+                else:
                     notes.append(
                         f"网页端通道({TC_ERRNO_SHORT.get(w_errno, w_msg or w_errno)})")
-                else:
-                    notes.append("网页端通道(参数校验未通过，说明该入口也要 z)")
+            elif seen.get("status") == "param_error":
+                log("  网页端通道: 此前实测 errno=2（该入口同样要 z），跳过"
+                    "（14 天后或换设备标识会自动重试）", "INFO", self.log_tag)
             else:
-                log("  cookie 无 MAWEBCUID（或网页端通道被 BAIDUWP_TASKCENTER_WEB=0 关闭），"
-                    "跳过网页端通道", "INFO", self.log_tag)
+                log("  cookie/Jar 里没有 MAWEBCUID 或 BAIDUID"
+                    "（或网页端通道被 BAIDUWP_TASKCENTER_WEB=0 关闭），跳过网页端通道",
+                    "INFO", self.log_tag)
 
             # 2) 任务系统 App 通道（真机链路，带 z）
             tc_data, tc_error = self._taskcenter_signin_device(self.device, tries=1)
