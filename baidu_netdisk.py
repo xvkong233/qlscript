@@ -39,14 +39,21 @@ cron: 30 8 * * *
   BAIDUWP_TASKCENTER_WEB 网页端通道（clienttype=5 + MAWEBCUID，不需要 z）开关，默认 1；
                           仅在 cookie 带 MAWEBCUID 时才会被尝试
 
-  BAIDUWP_Z               sofire 设备指纹（默认内置 MuMu Android 15 抓包值；
+  BAIDUWP_PROFILE         机型画像（默认 xiaomi14）：控制 channel 与 WebView UA 里的机型/系统版本。
+                          xiaomi14 = Xiaomi 14 / 23127PN0CC / HyperOS 1.0 (Android 14)
+                          xiaomi14-hyperos2 = 同机升 HyperOS 2.0 (Android 15)
+                          vivo-v2364a = 原抓包机（内置 z 的来源，需完全复刻时用）
+                          客户端的 channel 与 UA 都从同一个 Build 取值，只改一处就会互相矛盾
+                          （“channel 写小米、UA 写 vivo”比用错机型更像伪造），脚本会自动报错。
+
+  BAIDUWP_Z               sofire 设备指纹（默认内置 MuMu/vivo V2364A 抓包值；
                           换设备后请用自己的抓包值覆盖）
   BAIDUWP_Z_n             第 n 个账号专用 z（优先于 BAIDUWP_Z）——多账号想走通
                           任务中心通道，必须每账号取自己的 z：在该账号登录的 App 上
                           跑 work/frida/get_clientinfo.py，取 FH.gz(context)
-  BAIDUWP_CHANNEL         分发渠道，默认 android_15_V2364A_bd-netdisk_1027840c
+  BAIDUWP_CHANNEL         分发渠道（默认由画象推导 android_<版本>_<机型>_bd-netdisk_1027840c）
   BAIDUWP_CHANNEL_n       第 n 个账号专用渠道（优先于 BAIDUWP_CHANNEL）
-  BAIDUWP_UA              WebView UA，默认内置 Android 15 wv UA
+  BAIDUWP_UA              WebView UA（默认由画象推导），与 channel 必须同机型/同版本
 
   BAIDUWP_DEVICE          指定本机使用的任务中心设备标识（全局，覆盖自动派生）
   BAIDUWP_DEVICE_n        第 n 个账号专用的设备标识（优先于 BAIDUWP_DEVICE）
@@ -190,33 +197,98 @@ PC_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "X-Requested-With": "XMLHttpRequest",
 }
+TASK_BASE = {
+    "clienttype": "1", "app": "android",
+    "version": "13.34.3", "versioncode": "4228",
+}
+
+# ---------------------------------------------------------------------------
+# 设备画像（机型指纹）：channel 与 UA 必须同源，否则一眼假
+#
+# 客户端 channel 的构造（jadx：newhome/fr10.java，mars 公共参数 Platform）：
+#     "android_" + Build.VERSION.RELEASE + "_" + Build.MODEL + "_bd-netdisk_" + 后缀
+# 网盘本体后缀为 1027840c（真机抓包：android_15_V2364A_bd-netdisk_1027840c，
+# Release=15、Model=V2364A 均来自 Build）。
+# WebView UA 里又同时带一遍 RELEASE 与 Build.MODEL：
+#     Mozilla/5.0 (Linux; Android <RELEASE>; <MODEL> Build/<Build.ID>; wv) ...
+# 所以两处必须取自同一个机型画像 —— “channel 写小米、UA 写 vivo”比用错机型
+# 本身更像伪造。
+#
+# 画像均为真实在售/存量机型；默认 xiaomi14（23127PN0CC 是小米 14 国行的
+# Build.MODEL，出厂 Android 14 / HyperOS 1.0）。
+# ---------------------------------------------------------------------------
+CHANNEL_SUFFIX = "1027840c"
+DEVICE_PROFILES = {
+    "xiaomi14": {
+        "label": "Xiaomi 14 / 23127PN0CC / HyperOS 1.0 (Android 14)",
+        "model": "23127PN0CC", "release": "14",
+        "build_id": "UKQ1.231003.002", "chrome": "120.0.6099.230",
+    },
+    "xiaomi14-hyperos2": {
+        "label": "Xiaomi 14 / 23127PN0CC / HyperOS 2.0 (Android 15)",
+        "model": "23127PN0CC", "release": "15",
+        "build_id": "AP2A.240905.003", "chrome": "131.0.6778.135",
+    },
+    "vivo-v2364a": {
+        "label": "vivo V2364A（原抓包机，仅作对照）",
+        "model": "V2364A", "release": "15",
+        "build_id": "V417IR", "chrome": "110.0.5481.154",
+    },
+}
+DEFAULT_PROFILE = "xiaomi14"
+
+
+def _profile_key(name: str) -> str:
+    """把环境变量里的画像名归一化；写错就回落到默认机型，并在日志里说一声。"""
+    key = (name or "").strip() or DEFAULT_PROFILE
+    if key in DEVICE_PROFILES:
+        return key
+    log(f"BAIDUWP_PROFILE={key} 不在内置画像里，回落到 {DEFAULT_PROFILE}", "WARN")
+    return DEFAULT_PROFILE
+
+
+def _ua_webview(p: dict) -> str:
+    """WebView UA（结构对齐真机抓包：版本号 + Build/<id> + wv + Version/4.0）。"""
+    return (f"Mozilla/5.0 (Linux; Android {p['release']}; {p['model']} "
+            f"Build/{p['build_id']}; wv) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Version/4.0 Chrome/{p['chrome']} Safari/537.36")
+
+
+def _ua_browser(p: dict) -> str:
+    """普通 Chrome UA（用于 REST 接口与网页预热，不带 wv/Version4）。"""
+    return (f"Mozilla/5.0 (Linux; Android {p['release']}; {p['model']}) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{p['chrome']} Mobile Safari/537.36")
+
+
+DEVICE_PROFILE_NAME = _profile_key(os.getenv("BAIDUWP_PROFILE", "").strip())
+DEVICE_PROFILE = DEVICE_PROFILES[DEVICE_PROFILE_NAME]
+PROFILE_CHANNEL = (f"android_{DEVICE_PROFILE['release']}_{DEVICE_PROFILE['model']}"
+                   f"_bd-netdisk_{CHANNEL_SUFFIX}")
+PROFILE_UA = _ua_webview(DEVICE_PROFILE)
+PROFILE_BROWSER_UA = _ua_browser(DEVICE_PROFILE)
+
+# 2026-10 真机抓包（App 13.34.3）：任务系统 H5 实际发送的
+# /coins/taskcenter/signin 参数。缺 z/channel/offlinepackage 时服务端会在
+# 「真要签的那一天」返回 errno=2 param error（已签日会短路返回，不足以验证）。
+#   z            sofire 设备指纹 com.baidu.sofire.ac.FH.gz(context)
+#   channel      分发渠道 android_<RELEASE>_<MODEL>_bd-netdisk_1027840c
+#   offlinepackage 离线包版本表（服务端参数校验用）
+# channel/UA 默认由设备画像推导；要换真实机型优先用 BAIDUWP_PROFILE，
+# 确实要贴别人抓包值时再用 BAIDUWP_CHANNEL / BAIDUWP_UA（两者请同时换）。
+TASK_CHANNEL = os.getenv("BAIDUWP_CHANNEL", "").strip() or PROFILE_CHANNEL
+SOFIRE_Z = os.getenv("BAIDUWP_Z", "").strip() or     ("3F6OTvsektth3-SLi2w11NlkNuROxENXQ4tcVJU9Y2bUfkGryNBdGUb7sk"
+     "ERYWTmmv2TVskuoIWo5J00p-4VLHA")
+TASK_UA = os.getenv("BAIDUWP_UA", "").strip() or PROFILE_UA
+
 # points-center H5（App 任务中心/积分中心 WebView）的请求头：
 # 移动端 UA + 页面 Referer，与真实签到链路保持一致
 CENTER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
+    "User-Agent": PROFILE_UA,
     "Referer": "https://pan.baidu.com/operation/activitys/points/main",
     "Accept": "application/json, text/plain, */*",
     "X-Requested-With": "XMLHttpRequest",
 }
-TASK_BASE = {
-    "clienttype": "1", "channel": "android_16_script_bd-netdisk_1027840c",
-    "app": "android", "version": "13.34.3", "versioncode": "4228",
-}
-
-# 2026-10 真机抓包（MuMu Android 15 / App 13.34.3）：任务系统 H5 实际发送的
-# /coins/taskcenter/signin 参数。缺 z/channel/offlinepackage 时服务端会在
-# 「真要签的那一天」返回 errno=2 param error（已签日会短路返回，不足以验证）。
-#   z            sofire 设备指纹 com.baidu.sofire.ac.FH.gz(context)
-#   channel      分发渠道，形如 android_15_<机型>_bd-netdisk_1027840c
-#   offlinepackage 离线包版本表（服务端参数校验用）
-# 三者均可用环境变量覆盖；z 与 channel 建议取自己真实设备的抓包值。
-TASK_CHANNEL = os.getenv("BAIDUWP_CHANNEL", "").strip() or     "android_15_V2364A_bd-netdisk_1027840c"
-SOFIRE_Z = os.getenv("BAIDUWP_Z", "").strip() or     ("3F6OTvsektth3-SLi2w11NlkNuROxENXQ4tcVJU9Y2bUfkGryNBdGUb7sk"
-     "ERYWTmmv2TVskuoIWo5J00p-4VLHA")
-TASK_UA = os.getenv("BAIDUWP_UA", "").strip() or     ("Mozilla/5.0 (Linux; Android 15; V2364A Build/V417IR; wv) "
-     "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
-     "Chrome/110.0.5481.154 Safari/537.36")
 TASK_OFFLINE_PACKAGE = {
     "2004": {
         "version": 93
@@ -842,8 +914,7 @@ class BaiduPan:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
+                "User-Agent": PROFILE_BROWSER_UA,
                 "Referer": "https://pan.baidu.com/wap/svip/growth/task",
                 "Accept": "application/json, text/plain, */*",
                 "X-Requested-With": "XMLHttpRequest",
@@ -2463,8 +2534,58 @@ def random_delay():
     time.sleep(seconds)
 
 
+def device_profile_warnings() -> list:
+    """校验「channel / WebView UA / 机型画像」三者是否自洽。
+
+    真实客户端里三者的取值都来自同一个 Build：channel 是
+    android_<RELEASE>_<MODEL>_bd-netdisk_<后缀>，UA 里又有
+    Android <RELEASE>; <MODEL> Build/<id>。只改一处就会出现
+    “channel 写小米、UA 写 vivo”这种自相矛盾 —— 它比“用错机型”更容易被判定为伪造。
+    """
+    warns = []
+    prof = DEVICE_PROFILE
+    m_chan = re.search(r"^android_([0-9.]+)_([^_]+)_bd-netdisk_", TASK_CHANNEL)
+    m_ua = re.search(r"Android ([0-9.]+);\s*([^;]+?)\s+Build/", TASK_UA)
+    if not m_chan:
+        warns.append(f"channel 形态不认识（应为 android_<版本>_<机型>_bd-netdisk_<后缀>）："
+                     f"{TASK_CHANNEL}")
+    if not m_ua:
+        warns.append(f"UA 里找不到 'Android <版本>; <机型> Build/<id>' 结构：{TASK_UA[:60]}…")
+    if m_chan and m_ua:
+        chan_rel, chan_model = m_chan.group(1), m_chan.group(2)
+        ua_rel, ua_model = m_ua.group(1), m_ua.group(2)
+        if chan_model != ua_model:
+            warns.append(f"channel 机型({chan_model}) 与 UA 机型({ua_model}) 不一致"
+                         " —— 这是“一眼假”的头号特征")
+        if chan_rel != ua_rel:
+            warns.append(f"channel Android 版本({chan_rel}) 与 UA 版本({ua_rel}) 不一致")
+        if chan_model != prof["model"]:
+            warns.append(f"channel 机型({chan_model}) 与机型画像({prof['model']}) 不一致"
+                         "（自己改过 BAIDUWP_CHANNEL？）")
+    return warns
+
+
+def log_device_profile():
+    """开局打一次设备画像与指纹参数，并自查自洽性。"""
+    log(f"设备画像: {DEVICE_PROFILE_NAME} — {DEVICE_PROFILE['label']}")
+    log(f"  channel: {TASK_CHANNEL}")
+    log(f"  UA: {TASK_UA}")
+    warns = device_profile_warnings()
+    for w in warns:
+        log(f"  指纹不自洽: {w}", "WARN")
+    if not warns:
+        log("  指纹自洽: channel / UA / 机型同源", "DEBUG")
+    # 内置 z 是从 vivo V2364A 的 MuMu 实例上抓的：机型画像换成小米 14 后，
+    # 如果服务端拿 z 与声明的机型对账，就会“机器是同一个人脸不对”。
+    if not os.getenv("BAIDUWP_Z", "").strip() and DEVICE_PROFILE_NAME != "vivo-v2364a":
+        log("  z 来源: 内置抓包值（来自 vivo V2364A），与当前机型画像不同源；"
+            "若该通道要求 z 与机型一致，请用 BAIDUWP_PROFILE=vivo-v2364a，"
+            "或提供这台机型的 BAIDUWP_Z / BAIDUWP_Z_n", "WARN")
+
+
 def main():
     random_delay()
+    log_device_profile()
     cookies = load_cookies()
     if not cookies:
         print("未配置 cookie 环境变量：BAIDUWP_COOKIE（或 BAIDUWP_COOKIE_1、_2 ...）")
