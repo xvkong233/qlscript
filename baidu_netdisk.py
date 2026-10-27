@@ -30,9 +30,20 @@ cron: 30 8 * * *
   /coins/taskcenter/signin，必须带 z / channel / offlinepackage 等完整客户端参数。
   points-center（signinv2/center）仅作旧账号回退。
 
+  重要：z 是 sofire 反欺诈指纹（com.baidu.sofire.ac.FH.gz），由本机按
+  「设备 + 登录态」算出，不能跨账号重放。内置 z 只属于抓包账号，
+  其它账号跑这条通道只会拿到 errno=2；脚本会把 z 的归属账号记到
+  登记表里并在后续运行自动跳过，不再每天白撞。
+
+  BAIDUWP_TASKCENTER     任务中心通道总开关，置 0 完全关闭（只留成长值/答题/PC 积分）
+  BAIDUWP_TASKCENTER_WEB 网页端通道（clienttype=5 + MAWEBCUID，不需要 z）开关，默认 1；
+                          仅在 cookie 带 MAWEBCUID 时才会被尝试
+
   BAIDUWP_Z               sofire 设备指纹（默认内置 MuMu Android 15 抓包值；
                           换设备后请用自己的抓包值覆盖）
-  BAIDUWP_Z_n             第 n 个账号专用 z（优先于 BAIDUWP_Z）
+  BAIDUWP_Z_n             第 n 个账号专用 z（优先于 BAIDUWP_Z）——多账号想走通
+                          任务中心通道，必须每账号取自己的 z：在该账号登录的 App 上
+                          跑 work/frida/get_clientinfo.py，取 FH.gz(context)
   BAIDUWP_CHANNEL         分发渠道，默认 android_15_V2364A_bd-netdisk_1027840c
   BAIDUWP_CHANNEL_n       第 n 个账号专用渠道（优先于 BAIDUWP_CHANNEL）
   BAIDUWP_UA              WebView UA，默认内置 Android 15 wv UA
@@ -399,6 +410,23 @@ CENTER_ERRNO = {
 }
 CENTER_RISK_ERRNO = {8001, 8011, 8024}
 DEVICE_RISK_ERRNO = {9302, 9306, 9312, 35103, 35104}
+
+# 任务系统通道（/coins/taskcenter/*）错误码的短标签：只用于推送/注释，
+# 详细解读走 _tc_advice()，避免把「param error」这种服务端原文直接甩给用户。
+TC_ERRNO_SHORT = {
+    2: "参数校验未通过",
+    9230: "业务层拒绝",
+    9312: "设备重复",
+}
+
+# 任务中心通道总开关。实测该通道的 z 不是可跨账号重放的参数（见 _tc_advice），
+# 多数账号注定失败，只想看其它三项收益时可以关掉，省掉每条通道的请求。
+TASKCENTER_ENABLED = os.getenv("BAIDUWP_TASKCENTER", "").strip().lower() not in (
+    "0", "false", "off", "no")
+# 网页端通道（clienttype=5 + MAWEBCUID，不带 sofire z）：会话本身就是网页端时
+# 这条最便宜，且是唯一「不需要 z」的尝试。默认开，置 0 关闭。
+TASKCENTER_WEB = os.getenv("BAIDUWP_TASKCENTER_WEB", "").strip().lower() not in (
+    "0", "false", "off", "no")
 # 官方 H5 getNewSignList() 固定参数：action=1（日常签到）+ ptype=5（会员积分中心）
 CENTER_ACTION = "1"
 CENTER_PTYPE = "5"
@@ -601,13 +629,19 @@ class DeviceRegistry:
         {
           "version": 1,
           "accounts": {"<account_key>": {"device": "...", "used_at": 0}},
-          "devices":  {"<device>": {"cooldown_until": 0, "is_new_device": null}}
+          "devices":  {"<device>": {"cooldown_until": 0, "is_new_device": null}},
+          "zc":       {"uid": "<z 的来源账号 uid>", "z_fp": "<z 指纹前8位>"}
         }
+
+    zc（z-owner）：内置 sofire z 只对「抓包时登录的那个账号」有效，这是实测结论
+    （同一份 z/channel/offlinepackage，只有抓包账号能过参数校验，其余账号一律
+    errno=2）。把它记下来，后续运行就不会让其它账号每天白撞一次。
     """
 
     def __init__(self, path: str):
         self.path = path
-        self.data = {"version": 1, "accounts": {}, "devices": {}, "growth": {}}
+        self.data = {"version": 1, "accounts": {}, "devices": {},
+                     "growth": {}, "zc": {}}
         self._run_shared_users = {}      # device -> account_key（仅本次进程运行期）
         try:
             with open(self.path, encoding="utf-8") as f:
@@ -616,6 +650,7 @@ class DeviceRegistry:
                 self.data["accounts"] = raw.get("accounts") or {}
                 self.data["devices"] = raw.get("devices") or {}
                 self.data["growth"] = raw.get("growth") or {}
+                self.data["zc"] = raw.get("zc") or {}
                 self._gc()
         except FileNotFoundError:
             pass
@@ -731,6 +766,30 @@ class DeviceRegistry:
         """释放本次运行对共享设备的占用（失败时调用，避免瞬时问题烧掉整池）。"""
         self._run_shared_users.pop(device, None)
 
+    def set_z_owner(self, uid: str, z: str):
+        """记住内置 z 的来源账号（首个通过参数校验的账号）。
+
+        绑定 z 指纹：用户换了 BAIDUWP_Z 之后指纹变了，owner 结论自动作废重学，
+        不会因为一条过期的登记把新 z 也当成「只属于某个老账号」。
+        """
+        if not uid:
+            return
+        self.data["zc"] = {
+            "uid": str(uid),
+            "z_fp": hashlib.md5(str(z).encode("utf-8")).hexdigest()[:8],
+            "at": time.time(),
+        }
+        self.save()
+
+    def z_owner(self) -> dict:
+        """返回 z 的归属记录；超过 14 天就当没学过（避免旧结论永久生效）。"""
+        item = self.data.get("zc") or {}
+        if not item.get("uid"):
+            return {}
+        if time.time() - float(item.get("at") or 0) > 14 * 86400:
+            return {}
+        return item
+
     def acquire_shared(self, device: str, account_key: str) -> bool:
         """备用设备池独占：本次运行内同一台共享设备只允许一个账号使用。"""
         owner = self._run_shared_users.get(device)
@@ -782,6 +841,12 @@ class BaiduPan:
             f"cookie=[BDUSS/STOKEN 已隐藏]", "INFO", self.log_tag)
         log(f"任务中心设备: {self.device}（来源: "
             f"{'环境变量指定' if self.device != self._legacy_device(self.cookie) else '登记表/老算法'}）",
+            "INFO", self.log_tag)
+        z_label, z_value = self._tc_z_source()
+        # z 来源直接决定任务系统通道能不能成：内置值只属于抓包账号
+        log(f"任务系统 z: 来源={z_label} 长度={len(z_value)}"
+            + ("（非本账号专属：仅当本账号就是抓包账号时才会通过参数校验）"
+               if z_label == "内置抓包值" else ""),
             "INFO", self.log_tag)
 
     def _load_cookies_into_jar(self, cookie: str):
@@ -890,6 +955,7 @@ class BaiduPan:
         self.account_key = self._account_key()
         if os.getenv("BAIDUWP_DEVICE_RESET", "").strip() in ("1", "true", "True"):
             self.registry.data["accounts"].pop(self.account_key, None)
+            self.registry.data["zc"] = {}          # 连同「z 属于哪个账号」一起重学
             self.registry.save()
         override = (os.getenv(f"BAIDUWP_DEVICE_{self.index}", "").strip()
                     or os.getenv("BAIDUWP_DEVICE", "").strip())
@@ -1119,31 +1185,49 @@ class BaiduPan:
 
     # ---------- 4. 任务中心辅助：设备链 / 旧通道 ----------
     def _web_cuid(self) -> str:
-        """从 cookie 里取网页端 CUID（MAWEBCUID=web_xxx）。
+        """取网页端 CUID（MAWEBCUID=web_xxx）。
 
         它由服务端下发给浏览器，属于服务端已知的设备标识；
-        与脚本派生并伪装的安卓设备不是一回事。取不到返回空串。
+        与脚本派生并伪装的安卓设备不是一回事。
+
+        优先读用户粘贴的 cookie 串；读不到再看会话 Jar —— 青龙里通常只填
+        `BDUSS`/`STOKEN`，而 MAWEBCUID 是 _warmup_session() 访问网页时
+        服务端 Set-Cookie 下发的，只看原串会漏掉它（网页端通道就永远不触发）。
+        取不到返回空串。
         """
         m = re.search(r"MAWEBCUID=([^;,\s]+)", self.cookie)
-        return m.group(1) if m else ""
+        if m:
+            return m.group(1)
+        jar = getattr(self, "session", None)
+        if jar is not None:
+            try:
+                for cookie in jar.cookies:
+                    if cookie.name == "MAWEBCUID" and cookie.value:
+                        return cookie.value
+            except Exception:            # noqa: BLE001 取不到就当没有
+                pass
+        return ""
 
     def _taskcenter_signin_web(self) -> dict:
         """走网页端通道签一次：clienttype=5(wap) + 网页 CUID，不带安卓伪装。
 
         动机：脚本的会话本来就是网页端拿的（PANWEB=1 / BDCLND / MAWEBCUID），
-        而任务中心请求却一直用 clienttype=1&app=android&channel=android_* 伪装 App。
-        客户端类型与会话来源不一致，服务端有可能因此不认可那台伪造设备。
-        实测 clienttype=5/8/1 都能通过参数校验，所以这条通道本身是通的。
+        而任务中心请求一直用 clienttype=1&app=android&channel=android_* 伪装 App，
+        同时还得携带需要真机的 sofire z。会话类型与客户端声明不一致，
+        是这条链路一直只能靠 z 硬碰的原因。
+
+        这里是**唯一不需要 z 的尝试**：设备用服务端自己下发的 MAWEBCUID，
+        参数只用网页端会带的 task_id/task_from/is_growth，成本一次请求。
+        走 _pc_api（与其它任务中心请求同一出口），便于离线测试统一桩。
         """
-        params = {
-            "task_id": "1666916321758720", "task_id_str": "1666916321758720",
-            "task_from": "task_sys_daily", "is_growth": "1",
-        }
         web_cuid = self._web_cuid()
-        if web_cuid:
-            params["cuid"] = web_cuid
-            params["devuid"] = web_cuid
-        return self._api_get("/coins/taskcenter/signin", params)
+        params = {
+            "clienttype": "5",                  # wap/H5，与会话来源一致
+            "cuid": web_cuid, "devuid": web_cuid,
+            "task_id": "1666916321758720", "task_id_str": "1666916321758720",
+            "task_from": "task_sys_daily", "is_growth": "0",
+        }
+        return self._pc_api("/coins/taskcenter/signin", params)
 
     def _taskcenter_today_signed(self):
         """读任务系统签到日历，判断今天是否已签。True/False/None(取不到)。
@@ -1187,22 +1271,32 @@ class BaiduPan:
         SDK 依据设备信号算出，脚本侧无法复现，因此不提供该字段。
         """
         ts = int(time.time())
+        channel = self._task_channel()
         params = {
             "cuid": device, "devuid": device,
             "time": str(ts),
             "rand": str(random.randint(100000, 999999)),
-            "channel": TASK_BASE["channel"],
+            "channel": channel,
         }
         if self.uid:
             params["rchannel"] = hashlib.md5(
-                f"{APP_CLIENT_AK}{self.uid}{ts}{TASK_BASE['channel']}".encode("utf-8")
+                f"{APP_CLIENT_AK}{self.uid}{ts}{channel}".encode("utf-8")
             ).hexdigest()
         return params
 
+    def _tc_z_source(self) -> tuple:
+        """返回 (来源标签, z)。标签用来判断这份 z 是不是「本账号自己的」。"""
+        own = os.getenv(f"BAIDUWP_Z_{self.index}", "").strip()
+        if own:
+            return f"BAIDUWP_Z_{self.index}", own
+        shared = os.getenv("BAIDUWP_Z", "").strip()
+        if shared:
+            return "BAIDUWP_Z", shared
+        return "内置抓包值", SOFIRE_Z
+
     def _task_z(self) -> str:
         """按账号取 sofire z：BAIDUWP_Z_n > BAIDUWP_Z > 内置抓包值。"""
-        return (os.getenv(f"BAIDUWP_Z_{self.index}", "").strip()
-                or os.getenv("BAIDUWP_Z", "").strip() or SOFIRE_Z)
+        return self._tc_z_source()[1]
 
     def _task_channel(self) -> str:
         """按账号取 channel：BAIDUWP_CHANNEL_n > BAIDUWP_CHANNEL > 内置抓包值。"""
@@ -1289,7 +1383,12 @@ class BaiduPan:
             "INFO", self.log_tag)
 
     def _taskcenter_signin_device(self, device: str, tries: int = 3):
-        """在指定设备上尝试签到；仅 dev repeat 做退避重试。返回 (data, error)。"""
+        """在指定设备上尝试签到；仅 dev repeat 做退避重试。返回 (data, error)。
+
+        退避只在「确实还有下一次尝试」时才睡。上一版即使 tries=1 也会在
+        最后一次失败后 sleep 15s，实测三账号白等了 45s，日志还会打出
+        「15s 后重试(1/1)」这种与事实不符的行。
+        """
         data, error = {}, ""
         for attempt in range(tries):
             try:
@@ -1302,11 +1401,47 @@ class BaiduPan:
                 log(f"    signin 原始响应: {brief(data, 320)}", "WARN", self.log_tag)
             if data.get("errno") == 0 or "dev repeat" not in error:
                 return data, error
+            if attempt + 1 >= tries:
+                break                    # 最后一次不必再睡：没有下一次了
             wait = 15 * (attempt + 1)
-            log(f"    设备重复触发风控(dev repeat)，{wait}s 后重试({attempt + 1}/{tries})...",
-                "WARN", self.log_tag)
+            log(f"    设备重复触发风控(dev repeat)，{wait}s 后重试"
+                f"({attempt + 1}/{max(1, tries - 1)})...", "WARN", self.log_tag)
             time.sleep(wait)
         return data, error
+
+    @staticmethod
+    def _tc_success(data: dict) -> str:
+        """任务系统签到成功后的归一化结果行。"""
+        inner = (data.get("data") if isinstance(data, dict) else None) or {}
+        days = inner.get("signin_days")
+        suffix = f"，已连续签到 {days} 天" if days else ""
+        if inner.get("signed") == 1:
+            return f"任务中心签到: 今日已签到{suffix}"
+        return f"任务中心签到: 完成{suffix}"
+
+    def _tc_advice(self, errno, error: str) -> str:
+        """把任务系统通道的错误码翻译成「下一步该做什么」——只进日志，不进推送。"""
+        if errno == 2:
+            if self._tc_z_source()[0] == f"BAIDUWP_Z_{self.index}":
+                return ("errno=2 是鉴权之前的参数校验，与「设备未登记」无关。"
+                        "本账号已配置专属 z，说明 z 与设备/channel 不配套："
+                        "z 必须来自同一台设备（devuid 与抓包的 devuid 一致），"
+                        "或同时用 BAIDUWP_DEVICE_n 指定那台设备")
+            return ("errno=2 是鉴权之前的参数校验，与「设备未登记」无关。"
+                    "实测同一份 z/channel/offlinepackage，只有抓包账号能过校验，"
+                    "其余账号一律拿 2 —— z 是 sofire 按「设备+登录态」算出的指纹，"
+                    "不是可跨账号重放的静态参数。要让本账号走通，只能给它自己的："
+                    "在该账号登录的 App 上跑 work/frida/get_clientinfo.py 取 "
+                    "FH.gz(context)，写入 BAIDUWP_Z_%d（建议连 BAIDUWP_CHANNEL_%d 一起）"
+                    % (self.index, self.index))
+        if errno == 9230:
+            return ("errno=9230 是任务系统业务层拒绝。抓包账号用它自己的 z 也会拿到，"
+                    "且日历显示今日未签，所以不是「重复签到」——是服务端对该账号的"
+                    "活动/任务状态另有判定，客户端侧没有可补的参数")
+        if errno == 9312:
+            return ("errno=9312 设备重复：这台设备正在服务其它账号，"
+                    "或处于服务端校验窗口（已写冷却，不会连续重撞）")
+        return f"errno={errno} error={error or '无'}（未收录的错误码，已保留原始响应）"
 
     # ---------- 4. 任务中心签到（官方 H5 通道） ----------
     def _center_api(self, path: str, params: dict, device: str = "") -> dict:
@@ -1535,70 +1670,139 @@ class BaiduPan:
         return None, "", notes
 
     def taskcenter_signin(self) -> str:
-        """任务中心（积分中心）签到：完整复刻官方 H5 客户端链路。
+        """任务中心（任务系统）签到：按「成本从低到高」逐条通道尝试。
 
         逆向依据（App 13.34.3 真机抓包，2026-10）：
-          * 金币乐园（points-center）已下线，资产迁移到「任务系统」；
-            任务系统 H5（/operation/activitys/taskSystem/main）打开时会自动签到，
-            它调用的仍是 GET /coins/taskcenter/signin，但必须带完整客户端参数：
-              z / channel / cuid / devuid / version / versioncode /
-              offlinepackage / themeinfo / rchannel / task_id / task_from /
-              is_growth=0
-            缺 z/channel/offlinepackage 时，未签到的账号会得到 errno=2 param error
-            （已签日服务端会短路返回，因此看不出缺参数）。
-          * 任务系统日历 /coins/taskcenter/signinlist 返回 signed_today /
-            signin_days / day / signin_list，是当前签到状态的权威来源。
-          * points-center 的 signinv2/center 通道仅作旧账号回退；金币乐园活动已下线。
+          * 任务系统 H5（/operation/activitys/taskSystem/main）打开即自动签到，
+            调用 GET /coins/taskcenter/signin，带全量客户端参数
+            （z/channel/cuid/devuid/version/versioncode/offlinepackage/themeinfo/
+             rchannel/task_id/task_from/is_growth=0）。
+          * z 是 sofire 反欺诈指纹（com.baidu.sofire.ac.FH.gz），由本机按
+            「设备 + 登录态」算出。实测同一份 z 只有抓包账号能过参数校验，
+            其余账号一律 errno=2 —— 它不是可跨账号重放的静态参数，这条通道
+            天然只对 z 的来源账号有效。
+          * 任务系统日历 /coins/taskcenter/signinlist 的 signed_today 是状态权威源。
+          * points-center（signinv2/center/signin）仅作旧账号回退。
 
-        因此：先走任务系统通道；失败再回退 points-center（signinv2/center）。
+        通道顺序（每条都便宜，且互不依赖）：
+          0) 熔断：已签 / 通道关闭 / 内置 z 已知属他账号 -> 不发请求直接判
+          1) 网页端 clienttype=5 + MAWEBCUID（唯一不需要 z 的尝试，1 次请求）
+          2) 任务系统 App 通道（z + 全量参数）
+          3) 内置设备配对重试（冷却/占用中则跳过，不再空转 15s）
+          4) points-center -> 旧 H5 signin -> 旧原生（需显式开启）
         """
+        if not TASKCENTER_ENABLED:
+            log("任务中心签到: 已关闭（BAIDUWP_TASKCENTER=0），跳过全部通道",
+                "INFO", self.log_tag)
+            return "任务中心签到: 已关闭（BAIDUWP_TASKCENTER=0）"
+
         self._warmup_session()
 
-        # 1) 任务系统 H5 当前通道（App 13.34.3 实测：taskSystem/main 打开即签到）
-        #    真机抓包确认它调用 /coins/taskcenter/signin，且必须带 z/channel/
-        #    offlinepackage 等完整客户端参数；缺参数会在「真要签的那天」报 errno=2。
+        # 状态权威源：任务系统日历
         tc_signed = self._taskcenter_today_signed()
         log(f"任务系统签到日历: today_signed={tc_signed}", "INFO", self.log_tag)
         if tc_signed is True:
             return "任务中心签到: 今日已签到"
 
-        tc_data, tc_error = self._taskcenter_signin_device(self.device, tries=1)
-        tc_errno = tc_data.get("errno")
-        tc_msg = str(tc_data.get("error") or "")
-        log(f"  任务系统通道 signin -> errno={tc_errno} error={tc_msg or '无'}",
-            "INFO", self.log_tag)
-        if tc_errno == 0:
-            inner = tc_data.get("data") or {}
-            days = inner.get("signin_days")
-            suffix = f"，已连续签到 {days} 天" if days else ""
-            if inner.get("signed") == 1:
-                return f"任务中心签到: 今日已签到{suffix}"
-            return f"任务中心签到: 完成{suffix}"
-        if tc_errno == -6 or self._is_login_error(tc_msg):
-            return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+        notes = []
+        last_errno, last_error = None, ""
+        z_label, z_value = self._tc_z_source()
+        z_fp = hashlib.md5(z_value.encode("utf-8")).hexdigest()[:8]
+        owner = self.registry.z_owner()
+        owner_uid = str(owner.get("uid") or "")
+        # 内置/全局 z 已被实测证明属于某个账号时，其它账号不再每天白撞一次：
+        # z 指纹一变（用户换了 BAIDUWP_Z）就自动作废重学。
+        z_foreign = bool(z_label != f"BAIDUWP_Z_{self.index}" and owner_uid
+                         and owner.get("z_fp") == z_fp
+                         and self.uid and owner_uid != self.uid)
 
-        # 内置 z 来自 MuMu 设备；若账号自有设备与 z 不配对，用内置设备再试一次。
-        # （用户显式提供 BAIDUWP_Z 时说明 z 已与自己的设备匹配，不再替换设备）
-        if (tc_errno in (2, 9230) and self.device != TASK_DEVICE_BUILTIN
-                and not os.getenv("BAIDUWP_Z", "").strip()
-                and not os.getenv(f"BAIDUWP_Z_{self.index}", "").strip()):
-            log(f"  内置 z 配对设备重试: {TASK_DEVICE_BUILTIN}", "WARN", self.log_tag)
-            tc_data, tc_error = self._taskcenter_signin_device(
-                TASK_DEVICE_BUILTIN, tries=1)
+        if z_foreign:
+            log(f"  任务系统通道: 内置 z 属于 uid={owner_uid}（此前运行通过过参数校验），"
+                f"本账号 uid={self.uid} 未配置 BAIDUWP_Z_{self.index} -> 跳过该通道",
+                "WARN", self.log_tag)
+            notes.append(f"任务系统通道(z 属账号 {owner_uid}，未配 BAIDUWP_Z_{self.index})")
+        else:
+            # 1) 网页端通道：会话本身就是网页端，且不需要 sofire z
+            if TASKCENTER_WEB and self._web_cuid():
+                try:
+                    web = self._taskcenter_signin_web()
+                except (RuntimeError, requests.RequestException) as e:
+                    web = {"errno": -1, "error": f"{e.__class__.__name__}: {e}"}
+                w_errno = web.get("errno")
+                w_msg = str(web.get("error") or web.get("errmsg") or "")
+                log(f"  网页端通道(clienttype=5 + MAWEBCUID，无 z) -> errno={w_errno} "
+                    f"error={w_msg or '无'}", "INFO", self.log_tag)
+                if w_errno == 0:
+                    return self._tc_success(web)
+                if w_errno == -6 or self._is_login_error(w_msg):
+                    return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
+                if w_errno != 2:
+                    notes.append(
+                        f"网页端通道({TC_ERRNO_SHORT.get(w_errno, w_msg or w_errno)})")
+                else:
+                    notes.append("网页端通道(参数校验未通过，说明该入口也要 z)")
+            else:
+                log("  cookie 无 MAWEBCUID（或网页端通道被 BAIDUWP_TASKCENTER_WEB=0 关闭），"
+                    "跳过网页端通道", "INFO", self.log_tag)
+
+            # 2) 任务系统 App 通道（真机链路，带 z）
+            tc_data, tc_error = self._taskcenter_signin_device(self.device, tries=1)
             tc_errno = tc_data.get("errno")
             tc_msg = str(tc_data.get("error") or "")
-            log(f"  任务系统通道(内置设备) -> errno={tc_errno} "
-                f"error={tc_msg or '无'}", "INFO", self.log_tag)
+            log(f"  任务系统通道 signin -> errno={tc_errno} error={tc_msg or '无'}",
+                "INFO", self.log_tag)
             if tc_errno == 0:
-                inner = tc_data.get("data") or {}
-                days = inner.get("signin_days")
-                suffix = f"，已连续签到 {days} 天" if days else ""
-                if inner.get("signed") == 1:
-                    return f"任务中心签到: 今日已签到{suffix}"
-                return f"任务中心签到: 完成{suffix}"
-        tc_note = f"任务系统通道({CENTER_ERRNO.get(tc_errno, tc_msg or tc_errno)})"
+                return self._tc_success(tc_data)
+            if tc_errno == -6 or self._is_login_error(tc_msg):
+                return "任务中心签到: 失败（完整 cookie 已失效，需含 STOKEN）"
 
-        # 2) 回退：points-center 通道（旧版/灰度账号仍可能走这里）
+            if "dev repeat" in tc_msg or tc_errno == 9312:
+                # 现代路径原先不写冷却，导致同轮下一个账号拿同一台设备再撞一次
+                self.registry.set_cooldown(self.device, DEV_REPEAT_COOLDOWN,
+                                           self.account_key)
+                log(f"  设备已写 {max(1, DEV_REPEAT_COOLDOWN // 3600)}h 冷却，"
+                    "后续运行不再重撞", "WARN", self.log_tag)
+            elif tc_errno == 9230 and z_label != f"BAIDUWP_Z_{self.index}":
+                # 过了参数校验 = 这份 z 属于本账号，记下来给其它账号做熔断
+                self.registry.set_z_owner(self.uid, z_value)
+
+            notes.append(f"任务系统通道({TC_ERRNO_SHORT.get(tc_errno, tc_msg or tc_errno)})")
+            log(f"  错误码解读: {self._tc_advice(tc_errno, tc_msg)}",
+                "INFO" if tc_errno == 2 else "WARN", self.log_tag)
+
+            # 3) 内置设备配对重试：只对「内置 z 的来源账号」有意义，
+            #    并且必须先过冷却/占用两道门，否则必滞 dev repeat。
+            if (tc_errno in (2, 9230) and self.device != TASK_DEVICE_BUILTIN
+                    and z_label == "内置抓包值"):
+                builtin = TASK_DEVICE_BUILTIN
+                if self.registry.in_cooldown(builtin):
+                    left = self.registry.cooldown_left(builtin)
+                    log(f"  内置设备处于风控冷却（约 {max(1, left // 3600)}h 后解除），"
+                        "跳过配对重试", "WARN", self.log_tag)
+                    notes.append("内置设备(风控冷却中)")
+                elif not self.registry.acquire_shared(builtin, self.account_key):
+                    log("  内置设备本次运行已被其它账号占用，跳过配对重试",
+                        "WARN", self.log_tag)
+                    notes.append("内置设备(本次运行已被其它账号占用)")
+                else:
+                    log(f"  内置 z 配对设备重试: {builtin}", "WARN", self.log_tag)
+                    retry, _retry_err = self._taskcenter_signin_device(builtin, tries=1)
+                    r_errno = retry.get("errno")
+                    r_msg = str(retry.get("error") or "")
+                    log(f"  任务系统通道(内置设备) -> errno={r_errno} "
+                        f"error={r_msg or '无'}", "INFO", self.log_tag)
+                    if r_errno == 0:
+                        # 保持本轮独占，避免同轮其它账号又撞上去
+                        return self._tc_success(retry)
+                    if "dev repeat" in r_msg or r_errno == 9312:
+                        self.registry.set_cooldown(builtin, DEV_REPEAT_COOLDOWN,
+                                                   self.account_key)
+                    else:
+                        self.registry.release_shared(builtin)
+                    notes.append(
+                        f"内置设备({TC_ERRNO_SHORT.get(r_errno, r_msg or r_errno)})")
+
+        # 4) 回退：points-center 通道（旧版/灰度账号仍可能走这里）
         state = self._center_sign_state()
         if state.get("invalid"):
             log("任务中心签到失败: 服务端返回 bduss 错误，cookie 缺少有效 STOKEN",
@@ -1609,8 +1813,6 @@ class BaiduPan:
             suffix = f"，已连续签到 {days} 天" if days else ""
             return f"任务中心签到: 今日已签到{suffix}"
 
-        notes = [tc_note]
-        last_errno, last_error = None, ""
         version = state.get("version")
         version_name = {0: "旧版", 1: "灰度(CAN_BE_NEW)", 2: "新版"}.get(version, "未知")
         log(f"  签到版本 signin_version={version}（{version_name}）", "INFO", self.log_tag)
@@ -1623,7 +1825,7 @@ class BaiduPan:
                 "跳过 signinv2（该接口只对新签活动开放）", "INFO", self.log_tag)
             notes.append(f"signinv2(按版本 {version} 跳过)")
         else:
-            # 1) 官方 H5 新签通道：/coins/center/signinv2
+            # 4.1) 官方 H5 新签通道：/coins/center/signinv2
             data = self._center_sign_call(self.device)
             errno = data.get("errno")
             error = str(data.get("error") or data.get("errmsg") or "")
@@ -1645,7 +1847,7 @@ class BaiduPan:
                     "WARN", self.log_tag)
                 return f"任务中心签到: 今日已签到{suffix}"
 
-            # 2) 账号/设备类风控 -> 换一台备用已登记设备再试一次
+            # 4.2) 账号/设备类风控 -> 换一台备用已登记设备再试一次
             if errno in DEVICE_RISK_ERRNO or errno == 8001:
                 self.registry.set_cooldown(self.device, DEV_REPEAT_COOLDOWN, self.account_key)
                 alt_data, alt_device, alt_notes = self._center_sign_device_retry()
@@ -1653,7 +1855,7 @@ class BaiduPan:
                 if alt_data is not None and alt_data.get("errno") == 0:
                     return self._finish_center_sign(alt_data, alt_device)
 
-        # 3) 旧 H5 通道（有鉴权前风控门，脚本侧通常只会拿到 8001）
+        # 4.3) 旧 H5 通道（有鉴权前风控门，脚本侧通常只会拿到 8001）
         web_data = self._center_sign_call(self.device, "/coins/center/signin")
         web_errno = web_data.get("errno")
         web_error = str(web_data.get("error") or web_data.get("errmsg") or "")
@@ -1666,7 +1868,7 @@ class BaiduPan:
         if web_errno in CENTER_RISK_ERRNO:
             notes.append(f"旧 H5 通道({CENTER_ERRNO.get(web_errno, web_error or web_errno)})")
             log("  旧 H5 通道的风控门在鉴权之前（账号/设备维度），脚本没有 "
-                "sofire 指纹 z，无法通过；当前客户端签到走 signinv2，本来就不需要它",
+                "sofire 指纹 z，无法通过；新签通道(signinv2)本来就不需要它",
                 "WARN", self.log_tag)
         else:
             last_errno, last_error = web_errno, web_error
@@ -1680,13 +1882,11 @@ class BaiduPan:
 
         if version not in (0, 1):
             self._dump_center_home("收尾诊断")
-        detail = "；".join([n for n in notes if n]) or (last_error or f"errno={last_errno}")
+        detail = "；".join([n for n in notes if n]) or (last_error or "未知原因")
         hint = CENTER_ERRNO.get(last_errno) or TASKCENTER_ERRNO.get(last_errno) or ""
         log(f"任务中心签到失败明细: {detail}", "ERR", self.log_tag)
         if hint:
             log(f"  错误码解读(errno={last_errno}): {hint}", "ERR", self.log_tag)
-        log("  说明：任务系统通道要求完整客户端参数（z/channel/offlinepackage 等）；"
-            "errno=2 表示这些参数未通过校验，与「设备未登记」无关", "ERR", self.log_tag)
         return f"任务中心签到: 失败（{detail}）"
 
     def _taskcenter_signin_legacy(self) -> str:
