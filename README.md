@@ -39,10 +39,19 @@
 `"android_" + Build.VERSION.RELEASE + "_" + Build.MODEL + "_bd-netdisk_1027840c"`
 （`newhome/fr10.java` 里的 mars 公共参数 `Platform`，网盘本体后缀 `1027840c`），
 WebView UA 里又带一遍 `Android <RELEASE>; <MODEL> Build/<Build.ID>`。所以脚本改成**机型画像驱动**：
-`BAIDUWP_PROFILE` 默认 `xiaomi14`（Xiaomi 14 / `23127PN0CC` / HyperOS 1.0 / Android 14），
-channel、WebView UA、网页 UA、REST UA 全部从同一份 Build 推导，开局会自查并在不自洽时告警
-（"channel 写小米、UA 写 vivo"比用错机型更像伪造）。可选项：`xiaomi14-hyperos2`（同机 Android 15）、
-`vivo-v2364a`（原抓包机，内置 z 的来源）。改画像只需一个变量，不要单独改 `BAIDUWP_CHANNEL`/`BAIDUWP_UA`。
+`BAIDUWP_PROFILE` 默认 `xiaomi15`，channel、WebView UA、网页 UA、REST UA 全部从同一份 Build 推导，
+开局会自查并在不自洽时告警（"channel 写小米、UA 写 vivo"比用错机型更像伪造）。
+内置画像（型号码取自 [khwang9883/MobileModels](https://khwang9883.github.io/MobileModels/brands/xiaomi.html)）：
+
+| `BAIDUWP_PROFILE` | 机型 | `Build.MODEL` | 系统 |
+|---|---|---|---|
+| `xiaomi15`（默认） | Xiaomi 15 | `24129PN74C` | HyperOS 2.0 / Android 15 |
+| `xiaomi14ultra` | Xiaomi 14 Ultra | `24031PN0DC` | HyperOS 1.0 / Android 14 |
+| `xiaomi17promax` | Xiaomi 17 Pro Max | `2509FPN0BC` | HyperOS 3 / Android 16 |
+| `xiaomi14` | Xiaomi 14 | `23127PN0CC` | HyperOS 1.0 / Android 14 |
+| `vivo-v2364a` | vivo V2364A（原抓包机） | `V2364A` | Android 15 |
+
+改画像只需一个变量，不要单独改 `BAIDUWP_CHANNEL`/`BAIDUWP_UA`（真改了也会被开局自查点名）。
 
 **首次登录在云端建档（2026-10-27 APK 复核）**：设备号是**客户端生成**的（`CUID3StartupTask` → `DeviceId.getCUID()` → `PersonalConfig["deviceId"]`，服务端不下发设备号），App 把设备报给任务中心的唯一入口是 `PointCenterApi.checkDeviceUnique()` → `GET /coins/taskcenter/checkdevmp`（`CheckDeviceUniqueJob` 后台上报，只报不看）。所以脚本的做法是：**该账号第一次跑时本地生成一台新设备（`32位HEX|8位`）→ 用 `checkdevmp` 上报 → 结果落盘，之后一直用同一台**；已上报过就不再发请求。想换设备（一次性）：`BAIDUWP_DEVICE_ROTATE=1`，跑一次后删除（账号在服务端有设备上限，不能天天换）。注意：设备登记**不会**绕过 `signin` 的 `z` 门槛，它解决的是「每账号一台独立设备、不再共享 MuMu 设备吃 `dev repeat`」。登记状态存在 `.baidu_taskcenter_device.json` 的 `devices[<设备>].registration`，详见审计报告 §十三。
 

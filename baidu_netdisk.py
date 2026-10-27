@@ -39,12 +39,15 @@ cron: 30 8 * * *
   BAIDUWP_TASKCENTER_WEB 网页端通道（clienttype=5 + MAWEBCUID，不需要 z）开关，默认 1；
                           仅在 cookie 带 MAWEBCUID 时才会被尝试
 
-  BAIDUWP_PROFILE         机型画像（默认 xiaomi14）：控制 channel 与 WebView UA 里的机型/系统版本。
-                          xiaomi14 = Xiaomi 14 / 23127PN0CC / HyperOS 1.0 (Android 14)
-                          xiaomi14-hyperos2 = 同机升 HyperOS 2.0 (Android 15)
-                          vivo-v2364a = 原抓包机（内置 z 的来源，需完全复刻时用）
+  BAIDUWP_PROFILE         机型画像（默认 xiaomi15）：控制 channel 与 WebView UA 里的机型/系统版本。
+                          xiaomi15       = Xiaomi 15 / 24129PN74C / HyperOS 2.0 (Android 15)   ← 默认
+                          xiaomi14ultra  = Xiaomi 14 Ultra / 24031PN0DC / HyperOS 1.0 (Android 14)
+                          xiaomi17promax = Xiaomi 17 Pro Max / 2509FPN0BC / HyperOS 3 (Android 16)
+                          xiaomi14       = Xiaomi 14 / 23127PN0CC / HyperOS 1.0 (Android 14)
+                          vivo-v2364a    = 原抓包机（内置 z 的来源，需完全复刻时用）
+                          型号码取自 khwang9883/MobileModels（小米机型汇总）。
                           客户端的 channel 与 UA 都从同一个 Build 取值，只改一处就会互相矛盾
-                          （“channel 写小米、UA 写 vivo”比用错机型更像伪造），脚本会自动报错。
+                          （“channel 写小米、UA 写 vivo”比用错机型更像伪造），脚本会自动报警。
 
   BAIDUWP_Z               sofire 设备指纹（默认内置 MuMu/vivo V2364A 抓包值；
                           换设备后请用自己的抓包值覆盖）
@@ -219,23 +222,40 @@ TASK_BASE = {
 # ---------------------------------------------------------------------------
 CHANNEL_SUFFIX = "1027840c"
 DEVICE_PROFILES = {
+    # 型号码（Build.MODEL）均取自 khwang9883/MobileModels 的小米机型汇总，
+    # 括号里是官方 codename；build_id / chrome 取同代 Android 基线与该机型
+    # 出货时的 WebView 大版本，保证「版本号 ↔ 机型」不打架。
+    "xiaomi15": {
+        # Xiaomi 15（dada）国行 24129PN74C：2024-10 发布，出厂 Android 15 / HyperOS 2.0
+        "label": "Xiaomi 15 / 24129PN74C / HyperOS 2.0 (Android 15)",
+        "model": "24129PN74C", "release": "15",
+        "build_id": "AQ3A.240829.003", "chrome": "131.0.6778.135",
+    },
+    "xiaomi14ultra": {
+        # Xiaomi 14 Ultra（aurora）国行 24031PN0DC：2024-02 发布，出厂 Android 14
+        "label": "Xiaomi 14 Ultra / 24031PN0DC / HyperOS 1.0 (Android 14)",
+        "model": "24031PN0DC", "release": "14",
+        "build_id": "UKQ1.240103.001", "chrome": "121.0.6167.178",
+    },
+    "xiaomi17promax": {
+        # Xiaomi 17 Pro Max（popsicle）2509FPN0BC：2025-09 发布，出厂 Android 16 / HyperOS 3
+        "label": "Xiaomi 17 Pro Max / 2509FPN0BC / HyperOS 3 (Android 16)",
+        "model": "2509FPN0BC", "release": "16",
+        "build_id": "BP2A.250605.031.A3", "chrome": "140.0.7339.51",
+    },
     "xiaomi14": {
+        # Xiaomi 14（houji）国行 23127PN0CC：2023-10 发布，出厂 Android 14
         "label": "Xiaomi 14 / 23127PN0CC / HyperOS 1.0 (Android 14)",
         "model": "23127PN0CC", "release": "14",
         "build_id": "UKQ1.231003.002", "chrome": "120.0.6099.230",
     },
-    "xiaomi14-hyperos2": {
-        "label": "Xiaomi 14 / 23127PN0CC / HyperOS 2.0 (Android 15)",
-        "model": "23127PN0CC", "release": "15",
-        "build_id": "AP2A.240905.003", "chrome": "131.0.6778.135",
-    },
     "vivo-v2364a": {
-        "label": "vivo V2364A（原抓包机，仅作对照）",
+        "label": "vivo V2364A（原抓包机，内置 z 的来源）",
         "model": "V2364A", "release": "15",
         "build_id": "V417IR", "chrome": "110.0.5481.154",
     },
 }
-DEFAULT_PROFILE = "xiaomi14"
+DEFAULT_PROFILE = "xiaomi15"
 
 
 def _profile_key(name: str) -> str:
