@@ -50,6 +50,8 @@ cron: 30 8 * * *
 
   BAIDUWP_DEVICE          指定本机使用的任务中心设备标识（全局，覆盖自动派生）
   BAIDUWP_DEVICE_n        第 n 个账号专用的设备标识（优先于 BAIDUWP_DEVICE）
+  BAIDUWP_DEVICE_ROTATE   置 1 时为每个账号生成一台全新设备并重新建档（一次性动作，
+                          跑完请删除；账号在服务端有设备上限，不能每次运行都换）
   BAIDUWP_DEVICE_POOL     备用设备池，多台用 & 或 , 分隔；遇 9312/8001 时兜底，
                           运行期内每台最多服务一个账号，避免自造 dev repeat
   BAIDUWP_DEVICE_FILE     设备登记表落盘路径，默认脚本同目录
@@ -707,6 +709,29 @@ class DeviceRegistry:
     def is_known_new(self, device: str):
         return (self.data["devices"].get(device) or {}).get("is_new_device")
 
+    def note_registration(self, device: str, status: str, detail: str = ""):
+        """记录「首次登录设备上报」的结果。
+
+        status: reported（checkdevmp 返回 errno=0，上报成功，服务端已收到该 devuid）
+                param_error（errno=2：参数/风控层未过，设备信息根本没被受理）
+                login_error（cookie 失效）
+        注意：checkdevmp 是**单向上报**（CheckDeviceUniqueJob 是 BaseReportJob，
+        返回值 App 不使用），所以只能确认「报上去了」，不能确认「已建档」。
+        """
+        item = self.data["devices"].setdefault(device, {})
+        item["registration"] = {"status": status, "detail": detail,
+                                "at": time.time()}
+        self.save()
+
+    def registration(self, device: str) -> dict:
+        return (self.data["devices"].get(device) or {}).get("registration") or {}
+
+    def clear_registration(self, device: str):
+        item = self.data["devices"].get(device)
+        if isinstance(item, dict):
+            item.pop("registration", None)
+            self.save()
+
     def in_cooldown(self, device: str) -> bool:
         return float((self.data["devices"].get(device) or {}).get("cooldown_until") or 0) > time.time()
 
@@ -950,6 +975,22 @@ class BaiduPan:
             f"netdisk-taskcenter|{account_key}|devuid".encode("utf-8")).hexdigest()[:8]
         return f"{head}|{tail}"
 
+    @staticmethod
+    def _new_device() -> str:
+        """生成一台「形态合法」的新设备号：32 位大写 HEX | 8 位大写字母数字。
+
+        形态对齐 App（DeviceId.getCUID 的产物，如
+        `BBC8B8DCC4790CFD232CD628652EFDED|VUWSHHV6D`）。服务端不校验其内容
+        （审计报告 §3.2），但它必须**长期稳定**：每次运行都换就等于每天一台新设备，
+        会撞账号的设备上限（/netdisk/device_over_limit）。
+
+        用随机而不是 md5(账号)：派生值可预测且所有账号同构，没必要留这个指纹。
+        """
+        head = "".join(random.choice("0123456789ABCDEF") for _ in range(32))
+        tail = "".join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ0123456789")
+                       for _ in range(8))
+        return f"{head}|{tail}"
+
     def _resolve_device_identity(self):
         self.uid = self.get_uid()
         self.account_key = self._account_key()
@@ -962,9 +1003,17 @@ class BaiduPan:
         if override and not _is_valid_device(override):
             print(f"  BAIDUWP_DEVICE 形态异常已忽略: {override[:24]}...", flush=True)
             override = ""
+        rotate = os.getenv("BAIDUWP_DEVICE_ROTATE", "").strip() in ("1", "true", "True")
         if override:
             # 显式指定时不动登记表里原有的绑定，去掉环境变量即可恢复
             self.device = override
+        elif rotate and not override:
+            # 设备轮换：换一台全新的（账号设备上限有限，所以这是一次性动作，不是每天跑）
+            self.device = self._new_device()
+            self.registry.bind(self.account_key, self.device)
+            self.registry.clear_registration(self.device)
+            log(f"设备轮换: 本账号换用新设备 {self.device}（旧的就此作废）",
+                "WARN", self.log_tag)
         else:
             # 首次登记沿用老算法设备（老用户零回归，保住服务端可能已存在的绑定）；
             # 若已确认它在服务端就是"新设备"（没有登记记录），则改用由账号稳定身份
@@ -1026,6 +1075,19 @@ class BaiduPan:
                 f"{path} 响应非 JSON（HTTP {resp.status_code}，"
                 f"body 前 80 字节: {raw[:80]!r}；cookie 可能已失效）")
 
+    @staticmethod
+    def _redact(params: dict) -> dict:
+        """日志脱敏：z 是 sofire 设备指纹令牌，BDUSS/STOKEN 是凭据。
+
+        DEBUG 日志会把整个参数串打出来，z 一旦落盘/进日志就等于把设备指纹
+        送出去了（它 87 字符，能把 200 字的摘要全部占满，顺便把其它参数挤掉）。
+        """
+        out = dict(params or {})
+        for key in ("z", "BDUSS", "STOKEN", "bduss", "stoken"):
+            if out.get(key):
+                out[key] = _mask_credential(out[key], keep=6)
+        return out
+
     def _http_get(self, path: str, params: dict, headers: dict) -> dict:
         """统一出口：发请求 + 记录请求/响应摘要日志 + 统一错误。"""
         started = time.time()
@@ -1041,8 +1103,8 @@ class BaiduPan:
             log(f"HTTP {path} -> {resp.status_code}（{cost:.2f}s）", "ERR", self.log_tag)
             raise RuntimeError(f"{path} 请求失败 HTTP {resp.status_code}")
         data = self._decode_json(resp, path)
-        log_debug(f"GET {path} params={brief(params)} -> {brief(data, 160)} "
-                  f"({cost:.2f}s)", self.log_tag)
+        log_debug(f"GET {path} params={brief(self._redact(params))} -> "
+                  f"{brief(data, 160)} ({cost:.2f}s)", self.log_tag)
         return data
 
     def _api_get(self, path: str, extra_params: dict, headers: dict = None) -> dict:
@@ -1367,6 +1429,62 @@ class BaiduPan:
             self.registry.note_check(device, is_new)
         log(f"  checkdevmp({label}) -> is_new_device={is_new}", "INFO", self.log_tag)
         return is_new
+
+    def ensure_device_registered(self) -> str:
+        """首次登录时把本账号设备上报到云端（设备登记），每账号只做一次。
+
+        逆向依据（App 13.34.3，见审计报告 §十三）：
+          * 设备号是**客户端生成**的：CUID3StartupTask.run()
+              AppCommon.DEVUID = PersonalConfig["deviceId"]
+                              ?: DeviceId.getCUID(context)   # 首次启动生成并落盘
+            服务端没有「下发设备号」的接口，所以「新设备」只需一个新 devuid。
+          * App 里唯一把设备报给任务中心的入口：
+              PointCenterApi.checkDeviceUnique()
+                -> GET /coins/taskcenter/checkdevmp
+            它在 CheckDeviceUniqueJob（BaseReportJob）里跑，属后台上报，
+            响应 data 是字符串且 App 不解析 —— 即「只报不看」。
+          * 设备维度有上限与解绑（/netdisk/device_over_limit、/api/device/setmain、
+            /device/unbind），所以换设备是一次性动作，不能每次运行都换。
+
+        所以：“注册”= 本地生成一台新设备后，带全量客户端参数上报一次。
+        是否被受理只能看 errno：0 = 服务端收到；2 = 参数/风控层就没过
+        （z 不属本账号时必然如此），那个结果会落盘，下次运行自动重试。
+        """
+        state = self.registry.registration(self.device)
+        if state.get("status") == "reported":
+            stamp = time.strftime("%Y-%m-%d %H:%M",
+                                  time.localtime(float(state.get("at") or 0)))
+            log(f"  设备登记: 本账号设备已在 {stamp} 上报过，跳过",
+                "DEBUG", self.log_tag)
+            return ""
+
+        self._warmup_session()
+        try:
+            resp = self._taskcenter_checkdev(self.device)
+        except (RuntimeError, requests.RequestException) as e:
+            log(f"  设备登记: 上报请求失败 {e.__class__.__name__}: {e}",
+                "WARN", self.log_tag)
+            return ""
+        errno = resp.get("errno")
+        msg = str(resp.get("error") or resp.get("errmsg") or "")
+        log(f"  设备登记: checkdevmp -> errno={errno} error={msg or '无'} "
+            f"data={brief(resp.get('data'), 80)}", "INFO", self.log_tag)
+
+        if errno == 0:
+            self.registry.note_registration(self.device, "reported")
+            log(f"  设备登记: 完成。新设备 {self.device} 已带到服务端（首次登录建档）；"
+                f"之后一直用它，不再每天换", "INFO", self.log_tag)
+            return f"设备登记: 首次登录已上报新设备（…{self.device[-8:]}）"
+        if errno == -6 or self._is_login_error(msg):
+            self.registry.note_registration(self.device, "login_error", msg)
+            log("  设备登记: cookie 失效，无法上报（需含 STOKEN 的完整 cookie）",
+                "ERR", self.log_tag)
+            return ""
+        self.registry.note_registration(self.device, "param_error", msg or str(errno))
+        log("  设备登记: 参数/风控层未通过，本次没报上去（与服务端是否认识该设备无关）；"
+            f"配好本账号专属的 BAIDUWP_Z_{self.index} 后会自动重试",
+            "WARN", self.log_tag)
+        return ""
 
     def _dump_taskcenter_state(self, label: str):
         """签到失败且设备已在册时，把任务中心首页状态打进日志，定位非登记类失败。"""
@@ -2255,6 +2373,8 @@ class BaiduPan:
         """
         self.push = []
         try:
+            # 首次登录（本账号第一次跑）先把设备上报到云端，之后一直复用同一台
+            self.emit(self.ensure_device_registered())
             self.emit(self.growth_signin())
             self.emit(self.answer_daily_question())
             # 会员等级/升级预估不依赖积分与任务中心。放在它们之前计算，

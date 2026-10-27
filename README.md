@@ -35,6 +35,8 @@
 
 > **`z` 不能借给别人用（2026-10-27 三账号实跑结论）**：同一份 `z/channel/offlinepackage/version`，只有抓包账号能过参数校验（得到业务错误 `9230`），另两个账号一律 `errno=2`；拿内置设备去重试那两个账号，又变成 `9312 dev repeat`。所以 `z` 是按「设备 + 登录态」算出的指纹，不是可跨账号重放的静态参数。脚本现在的做法是：① 先试**不需要 z** 的网页端通道（`clienttype=5` + 服务端下发的 `MAWEBCUID`）；② 走 App 通道时，一旦发现这份 z 已属于另一个账号，后续运行对该账号直接熔断，不再每天白撞；③ 想真正走通，就给每个账号抓自己的 z：在已登录该账号的 App 上跑 `work/frida/get_clientinfo.py`，把输出的 `BAIDUWP_Z=<该账号的 z>` 填成 `BAIDUWP_Z_1` / `BAIDUWP_Z_2` ……（脚本启动日志会打印 `任务系统 z: 来源=...`，一眼能看出用的是谁的）。整条任务中心通道可用 `BAIDUWP_TASKCENTER=0` 关闭，网页端通道用 `BAIDUWP_TASKCENTER_WEB=0` 关闭。
 
+**首次登录在云端建档（2026-10-27 APK 复核）**：设备号是**客户端生成**的（`CUID3StartupTask` → `DeviceId.getCUID()` → `PersonalConfig["deviceId"]`，服务端不下发设备号），App 把设备报给任务中心的唯一入口是 `PointCenterApi.checkDeviceUnique()` → `GET /coins/taskcenter/checkdevmp`（`CheckDeviceUniqueJob` 后台上报，只报不看）。所以脚本的做法是：**该账号第一次跑时本地生成一台新设备（`32位HEX|8位`）→ 用 `checkdevmp` 上报 → 结果落盘，之后一直用同一台**；已上报过就不再发请求。想换设备（一次性）：`BAIDUWP_DEVICE_ROTATE=1`，跑一次后删除（账号在服务端有设备上限，不能天天换）。注意：设备登记**不会**绕过 `signin` 的 `z` 门槛，它解决的是「每账号一台独立设备、不再共享 MuMu 设备吃 `dev repeat`」。登记状态存在 `.baidu_taskcenter_device.json` 的 `devices[<设备>].registration`，详见审计报告 §十三。
+
 ### 王者营地签到（王者 + 万象棋双渠道）
 
 重放抓包参数完成营地「福利中心-每日签到」，支持**王者荣耀**（gameId 20001）和**王者万象棋**（gameId 30001）两个渠道，多账号。接口经真实抓包验证（2026-10，营地 App 10.114.0916）：`POST kohcamp.qq.com/operation/action/newsignin`，请求体由请求头里的 `gameId` / `campRoleId` 自动构造。
