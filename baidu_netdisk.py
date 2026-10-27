@@ -49,6 +49,16 @@ cron: 30 8 * * *
                           客户端的 channel 与 UA 都从同一个 Build 取值，只改一处就会互相矛盾
                           （“channel 写小米、UA 写 vivo”比用错机型更像伪造），脚本会自动报警。
 
+  --- sofire z / 风控应答 ---
+  z 只能在设备上现场生成（tools/z_provider.py 会把它按 uid 写进
+  .baidu_sofire_z.json），脚本按 uid 自动命中，不需要再手工复制。
+  BAIDUWP_Z_FILE          z 缓存文件路径，默认脚本目录 .baidu_sofire_z.json
+  BAIDUWP_Z_TTL_H         z 的保鲜期（小时），默认 24；过期自动忽略并告警
+  BAIDUWP_AC / BAIDUWP_AC_n   反作弊串透传（形如 ev=task&zid=...&aid=13503），
+                          由客户端 AntiCheatKt 产出，仅在真机过完验证的短窗口内有意义
+  BAIDUWP_DS / BAIDUWP_DS_n   百度验证 SDK 回传的 ds（一次性挑战应答）
+  BAIDUWP_TK / BAIDUWP_TK_n   同上 tk
+
   BAIDUWP_Z               sofire 设备指纹（默认内置 MuMu/vivo V2364A 抓包值；
                           换设备后请用自己的抓包值覆盖）
   BAIDUWP_Z_n             第 n 个账号专用 z（优先于 BAIDUWP_Z）——多账号想走通
@@ -280,6 +290,15 @@ def _ua_browser(p: dict) -> str:
             f"AppleWebKit/537.36 (KHTML, like Gecko) "
             f"Chrome/{p['chrome']} Mobile Safari/537.36")
 
+
+# 设备抓取得到的 sofire z（由 tools/z_provider.py 在真机/模拟器上生成并写入）。
+# 结构：{"version":1,"entries":{"<uid>":{"z":..., "channel":..., "device":...,
+#                                    "ua":..., "captured_at":...}}}
+# z 有保鲜期（服务端未必长期认），过期就不用 —— 宁可用旧的内置值并告警，
+# 也不要拿一张过期票去撞风控。
+Z_FILE = os.getenv("BAIDUWP_Z_FILE", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".baidu_sofire_z.json")
+SOFIRE_Z_TTL_H = float(os.getenv("BAIDUWP_Z_TTL_H", "24") or 24)
 
 DEVICE_PROFILE_NAME = _profile_key(os.getenv("BAIDUWP_PROFILE", "").strip())
 DEVICE_PROFILE = DEVICE_PROFILES[DEVICE_PROFILE_NAME]
@@ -979,6 +998,12 @@ class BaiduPan:
         # 补签通道（signinlist/supptasklist/suppsignin）与签到通道共用同一台设备，
         # 并统一带上任务系统 H5 的完整客户端参数（z/channel/offlinepackage…）。
         self.task_base = self._taskcenter_params(self.device)
+        self.param_warnings = self.params_selfcheck()
+        for w in self.param_warnings:
+            log(f"  参数自洽: {w}", "WARN", self.log_tag)
+        if not self.param_warnings:
+            log("  参数自洽: cuid/devuid/channel/rchannel/offlinepackage 全部对齐",
+                "DEBUG", self.log_tag)
         log(f"账号识别: uid={self.uid or '(未取到)'} account_key={self.account_key} "
             f"cookie=[BDUSS/STOKEN 已隐藏]", "INFO", self.log_tag)
         log(f"任务中心设备: {self.device}（来源: "
@@ -1469,11 +1494,53 @@ class BaiduPan:
             ).hexdigest()
         return params
 
+    def _z_file_entry(self) -> dict:
+        """读设备抓取文件里「本账号」那一份 z（按 uid 精确匹配，带保鲜期）。
+
+        文件由 tools/z_provider.py 在真机/模拟器上现场生成 —— 这是唯一能拿到
+        「属于这个登录态」的 z 的方式（z = sofire FH.gz(context)，native 现算）。
+        取不到/过期/uid 不匹配都返回 {}，让调用方回落到 env 或内置值。
+        """
+        cache = getattr(self, "_z_entry_cache", None)
+        if cache is not None:
+            return cache
+        entry = {}
+        try:
+            with open(Z_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and self.uid:
+            entry = ((data.get("entries") or {}).get(str(self.uid)) or {})
+        if entry.get("z"):
+            ts = float(entry.get("captured_at") or 0)
+            age_h = (time.time() - ts) / 3600.0 if ts else 0.0
+            if SOFIRE_Z_TTL_H and ts and age_h > SOFIRE_Z_TTL_H:
+                log(f"  z 文件: 本账号的抓取值已过期（{age_h:.1f}h > "
+                    f"{SOFIRE_Z_TTL_H:g}h），忽略；重新跑 tools/z_provider.py 即可刷新",
+                    "WARN", self.log_tag)
+                entry = {}
+            else:
+                entry = dict(entry)
+                entry["age_h"] = age_h
+        else:
+            entry = {}
+        self._z_entry_cache = entry
+        return entry
+
     def _tc_z_source(self) -> tuple:
-        """返回 (来源标签, z)。标签用来判断这份 z 是不是「本账号自己的」。"""
+        """返回 (来源标签, z)。标签用来判断这份 z 是不是「本账号自己的」。
+
+        优先级：BAIDUWP_Z_n（人工指定）> 设备抓取文件（按 uid）> BAIDUWP_Z > 内置值。
+        「设备抓取」这一档是唯一能拿到“本账号专属”z 的地道来源，其余两档都是
+        借用的票 —— 借用票只对票的主人有效（§12.2）。
+        """
         own = os.getenv(f"BAIDUWP_Z_{self.index}", "").strip()
         if own:
             return f"BAIDUWP_Z_{self.index}", own
+        entry = self._z_file_entry()
+        if entry.get("z"):
+            return f"设备抓取(uid={self.uid})", str(entry["z"])
         shared = os.getenv("BAIDUWP_Z", "").strip()
         if shared:
             return "BAIDUWP_Z", shared
@@ -1484,15 +1551,36 @@ class BaiduPan:
         return self._tc_z_source()[1]
 
     def _task_channel(self) -> str:
-        """按账号取 channel：BAIDUWP_CHANNEL_n > BAIDUWP_CHANNEL > 内置抓包值。"""
-        return (os.getenv(f"BAIDUWP_CHANNEL_{self.index}", "").strip()
-                or os.getenv("BAIDUWP_CHANNEL", "").strip() or TASK_CHANNEL)
+        """按账号取 channel。
+
+        优先级：BAIDUWP_CHANNEL_n > 设备抓取值(z 同一个进程抓的) > BAIDUWP_CHANNEL > 画像。
+        抓取值优先于全局 env：channel 和 z 是同一次 FH 现场产物，拆开就自相矛盾。
+        """
+        own = os.getenv(f"BAIDUWP_CHANNEL_{self.index}", "").strip()
+        if own:
+            return own
+        entry = self._z_file_entry()
+        if entry.get("channel"):
+            return str(entry["channel"])
+        return os.getenv("BAIDUWP_CHANNEL", "").strip() or TASK_CHANNEL
 
     def _taskcenter_params(self, device: str) -> dict:
-        """任务系统 H5（taskSystem/main）的完整客户端参数（App 13.34.3 抓包）。"""
+        """任务系统 H5（taskSystem/main）的完整客户端参数（App 13.34.3 抓包）。
+
+        在官方参数之外，这里还支持把「风控应答」透传进来（默认不启用）：
+
+          BAIDUWP_AC_n / BAIDUWP_AC   反作弊串，形如 `ev=task&zid=...&aid=13503`
+                                      （客户端 AntiCheatKt.buildTaskSaveAntiCheatParams
+                                       产出的就是这种 k=v&k=v，追加到 query 上）
+          BAIDUWP_DS_n / BAIDUWP_DS   百度验证 SDK 回传的 ds
+          BAIDUWP_TK_n / BAIDUWP_TK   同上 tk
+
+        ds/tk 是一次性 + 短时效的挑战应答，只在“刚在真机上过完验证”的那几分钟有意义，
+        所以脚本不做缓存、只在设了环境变量时带上。
+        """
         ts = int(time.time())
         channel = self._task_channel()
-        return {
+        params = {
             "z": self._task_z(),
             "clienttype": "1",
             "channel": channel,
@@ -1508,6 +1596,84 @@ class BaiduPan:
                 f"{APP_CLIENT_AK}{self.uid or '0'}{ts}{channel}".encode("utf-8")
             ).hexdigest(),
         }
+        # 参数自洽自查要用到 rchannel 的两个输入（time 不在参数里，所以单独留一份）
+        self._rc_inputs = (ts, channel)
+        self._taskcenter_params_extra(params)
+        return params
+
+    def _taskcenter_params_extra(self, params: dict):
+        """把用户显式提供的风控应答参数并进请求（默认一个都不加）。"""
+        raw = (os.getenv(f"BAIDUWP_AC_{self.index}", "").strip()
+               or os.getenv("BAIDUWP_AC", "").strip())
+        for part in raw.lstrip("&").split("&"):
+            if "=" in part:
+                key, val = part.split("=", 1)
+                if key.strip():
+                    params[key.strip()] = val.strip()
+        for key, env in (("ds", "BAIDUWP_DS"), ("tk", "BAIDUWP_TK")):
+            val = (os.getenv(f"{env}_{self.index}", "").strip()
+                   or os.getenv(env, "").strip())
+            if val:
+                params[key] = val
+
+    def params_selfcheck(self) -> list:
+        """校验任务中心请求参数是否自洽（真机上这些量都由同一个 Build/uid 现算）。
+
+        查的是“参数之间打不打架”，不是“服务端认不认”——后者只有服务端知道。
+        任何一条不通过都会进日志，但不会中断执行（签到优先）。
+        """
+        warns = []
+        p = getattr(self, "task_base", None)
+        if not isinstance(p, dict) or not p:
+            return ["task_base 未构建"]
+        cuid, devuid = str(p.get("cuid") or ""), str(p.get("devuid") or "")
+        if not _is_valid_device(cuid):
+            warns.append(f"cuid 形态非法: {cuid[:24]}")
+        if cuid != devuid:
+            warns.append(f"cuid({cuid[:16]}…) 与 devuid({devuid[:16]}…) 不一致"
+                         "（真机恒等）")
+        if self.device and cuid and cuid != self.device:
+            warns.append(f"cuid 与登记设备不一致: {cuid[:16]}… vs {self.device[:16]}…")
+
+        channel = str(p.get("channel") or "")
+        m_chan = re.match(r"^android_([0-9.]+)_([^_]+)_bd-netdisk_", channel)
+        m_ua = re.search(r"Android ([0-9.]+);\s*([^;]+?)\s+Build/", TASK_UA)
+        if not m_chan:
+            warns.append(f"channel 形态非法: {channel}")
+        elif m_ua:
+            if m_chan.group(2) != m_ua.group(2):
+                warns.append(f"channel 机型({m_chan.group(2)}) 与 UA 机型"
+                             f"({m_ua.group(2)}) 不一致")
+            if m_chan.group(1) != m_ua.group(1):
+                warns.append(f"channel 系统版本({m_chan.group(1)}) 与 UA"
+                             f"({m_ua.group(1)}) 不一致")
+
+        rc = str(p.get("rchannel") or "")
+        ts, chan = getattr(self, "_rc_inputs", (0, channel))
+        if len(rc) != 32 or any(c not in "0123456789abcdef" for c in rc):
+            warns.append(f"rchannel 不是 32 位小写 MD5: {rc[:16]}")
+        elif self.uid and ts:
+            expect = hashlib.md5(
+                f"{APP_CLIENT_AK}{self.uid}{ts}{chan}".encode("utf-8")).hexdigest()
+            if rc != expect:
+                warns.append("rchannel 与 MD5(AK+uid+time+channel) 对不上")
+
+        try:
+            op = json.loads(p.get("offlinepackage") or "{}")
+            if not isinstance(op, dict) or not op:
+                warns.append("offlinepackage 解析后为空")
+        except ValueError:
+            warns.append("offlinepackage 不是合法 JSON")
+
+        for key in ("version", "versioncode", "themeinfo", "app", "clienttype", "z"):
+            if not p.get(key):
+                warns.append(f"缺少参数 {key}")
+        if str(p.get("clienttype")) != "1":
+            warns.append(f"clienttype 应为 1（App 通道），实际 {p.get('clienttype')}")
+        z = str(p.get("z") or "")
+        if z and len(z) < 40:
+            warns.append(f"z 长度异常（{len(z)}），不像 sofire 产出的 87 字符令牌")
+        return warns
 
     def _taskcenter_signin_once(self, device: str, extra: dict = None) -> dict:
         """任务系统 H5 当前通道：GET /coins/taskcenter/signin（全量客户端参数）。"""

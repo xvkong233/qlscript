@@ -55,6 +55,29 @@ WebView UA 里又带一遍 `Android <RELEASE>; <MODEL> Build/<Build.ID>`。所�
 
 **首次登录在云端建档（2026-10-27 APK 复核）**：设备号是**客户端生成**的（`CUID3StartupTask` → `DeviceId.getCUID()` → `PersonalConfig["deviceId"]`，服务端不下发设备号），App 把设备报给任务中心的唯一入口是 `PointCenterApi.checkDeviceUnique()` → `GET /coins/taskcenter/checkdevmp`（`CheckDeviceUniqueJob` 后台上报，只报不看）。所以脚本的做法是：**该账号第一次跑时本地生成一台新设备（`32位HEX|8位`）→ 用 `checkdevmp` 上报 → 结果落盘，之后一直用同一台**；已上报过就不再发请求。想换设备（一次性）：`BAIDUWP_DEVICE_ROTATE=1`，跑一次后删除（账号在服务端有设备上限，不能天天换）。注意：设备登记**不会**绕过 `signin` 的 `z` 门槛，它解决的是「每账号一台独立设备、不再共享 MuMu 设备吃 `dev repeat`」。登记状态存在 `.baidu_taskcenter_device.json` 的 `devices[<设备>].registration`，详见审计报告 §十三。
 
+**sofire z / 风控应答（2026-10 APK 复核）**：`z` 是 `com.baidu.sofire.ac.FH.gz(context)` 在设备上**现场**算出来的
+87 字符令牌（解析后是 65 字节带签名的随机数据），生成逻辑在 native，且 SDK 初始化时绑定了 App 进程与登录态 ——
+所以它没法离线拼，只能"在设备上开票"。脚本现在的取 z 顺序是
+`BAIDUWP_Z_n` → **设备抓取文件（按 uid）** → `BAIDUWP_Z` → 内置抓包值。
+
+```bash
+# 1) 设备上起 frida-server（MuMu 默认 127.0.0.1:16384）
+# 2) 在该账号已登录的 App 上跑一次（多账号就逐个切换后各跑一次）
+python tools/z_provider.py --serial 127.0.0.1:16384
+#    等价于在设备上执行 FH.gz(context) + RequestCommonParams.getChannel()
+#    + AppCommon.DEVUID + AccountUtils.getUid()，并按 uid 写入 .baidu_sofire_z.json
+# 3) 直接跑签到脚本，z/channel 会按 uid 自动命中（默认 24h 保鲜，BAIDUWP_Z_TTL_H 可调）
+```
+
+**参数自洽自查**：每个账号初始化时都会验证
+`cuid == devuid == 登记设备`、`channel` 的机型/版本与 UA 一致、
+`rchannel == MD5(AK+uid+time+channel)`、`offlinepackage` 可解析、`clienttype=1`、`z` 长度正常；
+任何一条不自洽都会以 `参数自洽: …` 打进日志（不中断执行）。
+
+**风控应答透传**：客户端过风控靠 `AntiCheatKt`（`ev=task&zid=<FH.gzfi(ctx,"13503",3048)>&aid=13503`）
+与百度验证 SDK 的 `ds/tk`。这两个都是一次性、短时效的，脚本不做缓存，只在显式配置时透传：
+`BAIDUWP_AC`（原样 `k=v&k=v`，会拆成独立 query 参数）、`BAIDUWP_DS` / `BAIDUWP_TK`，均支持 `_n` 按账号。
+
 ### 王者营地签到（王者 + 万象棋双渠道）
 
 重放抓包参数完成营地「福利中心-每日签到」，支持**王者荣耀**（gameId 20001）和**王者万象棋**（gameId 30001）两个渠道，多账号。接口经真实抓包验证（2026-10，营地 App 10.114.0916）：`POST kohcamp.qq.com/operation/action/newsignin`，请求体由请求头里的 `gameId` / `campRoleId` 自动构造。
